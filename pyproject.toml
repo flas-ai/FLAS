@@ -1,0 +1,26 @@
+[project]
+name = "flas"
+version = "0.1.0"
+description = "Flow-based Activation Steering."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.44",
+    "accelerate",
+    "pytorch-lightning>=2.0",
+    "tensorboard",
+    "numpy",
+    "pandas",
+    "tqdm",
+    "openai>=1.0",
+    "pyarrow>=24.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flas"]
