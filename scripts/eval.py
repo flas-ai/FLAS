@@ -33,7 +33,7 @@ def main():
     parser.add_argument("--data-dir", type=str,
                         default="thirdparty/axbench/axbench/concept500/prod_2b_l20_v1/generate")
     parser.add_argument("--alpaca-eval", type=str,
-                        default="thirdparty/axbench/axbench/data/alpaca_eval.json")
+                        default="data/alpaca_eval.json")
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--max-concepts", type=int, default=500)
     parser.add_argument("--concept-ids-file", type=str, default=None,

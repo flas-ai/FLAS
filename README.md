@@ -36,13 +36,14 @@ The base LLM (Gemma-2-2B-IT or Gemma-2-9B-IT) is downloaded from Hugging Face. M
 
 ## Data
 
-FLAS trains on AxBench data. Clone the AxBench repo:
+FLAS trains on AxBench data. Clone the AxBench repo and download the AlpacaEval prompts (used by `scripts/eval.py`):
 
 ```bash
 git clone https://github.com/stanfordnlp/axbench thirdparty/axbench
+hf download tatsu-lab/alpaca_eval alpaca_eval.json --repo-type dataset --local-dir data
 ```
 
-Training data are at `thirdparty/axbench/axbench/<concept_set>/prod_<model>_<layer>_v1/generate/`.
+Training data (Concept500 / Concept16k parquets) are tracked in the AxBench repo via Git LFS, so `git clone` already pulls them. They live at `thirdparty/axbench/axbench/<concept_set>/prod_<model>_<layer>_v1/generate/`.
 
 For example, Concept500 on Gemma-2-2B-IT layer 20:
 
