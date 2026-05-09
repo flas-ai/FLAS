@@ -92,6 +92,9 @@ class FlasGenerator:
             text, return_tensors="pt", truncation=True, max_length=max_len
         ).to("cuda")
         hidden = self.concept_enc(enc.input_ids, enc.attention_mask)
+        # When the encoder shares modules with the base LLM (bf16) but the
+        # FlowFunction is in a different dtype (e.g. fp32), cast here.
+        hidden = hidden.to(self._flow_dtype)
         return hidden, enc.attention_mask.float()
 
     @torch.no_grad()
@@ -269,8 +272,14 @@ def load_generator(flow_ckpt, model_id=None, layer=None, num_blocks=None):
     flow_fn.load_state_dict(sd)
     flow_fn = flow_fn.to("cuda").eval()
 
-    concept_enc = ConceptEncoder(model_id, num_layers=2).to(target_dtype).to("cuda")
     if "concept_enc" in ckpt:
+        # Checkpoint provides its own (possibly fine-tuned) concept encoder weights.
+        concept_enc = ConceptEncoder(model_id, num_layers=2).to(target_dtype).to("cuda")
         concept_enc.load_state_dict(ckpt["concept_enc"])
+    else:
+        # Concept encoder was frozen during training — share modules with the
+        # base LLM to avoid loading a second copy of embed_tokens / first 2
+        # layers / norm / rotary_emb. Inherits base LLM's bf16 dtype.
+        concept_enc = ConceptEncoder.from_base_model(llm, num_layers=2)
 
     return FlasGenerator(llm, tokenizer, flow_fn, concept_enc, layer)

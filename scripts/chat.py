@@ -67,9 +67,13 @@ class InteractiveFlas:
         self.flow_fn.load_state_dict(ckpt["flow_fn"] if "flow_fn" in ckpt else ckpt)
         self.flow_fn = self.flow_fn.to("cuda").eval()
 
-        self.concept_enc = ConceptEncoder(model_id, num_layers=2).to("cuda")
         if "concept_enc" in ckpt:
+            self.concept_enc = ConceptEncoder(model_id, num_layers=2).to("cuda")
             self.concept_enc.load_state_dict(ckpt["concept_enc"])
+        else:
+            # Share modules with the base LLM — saves a duplicate copy of
+            # embed_tokens / first 2 decoder layers / norm / rotary_emb in VRAM.
+            self.concept_enc = ConceptEncoder.from_base_model(self.llm, num_layers=2)
 
         self.layer = layer
         self.flowtime = args.flowtime

@@ -247,13 +247,18 @@ class FlasModule(pl.LightningModule):
         return lm_loss
 
     def _save_pt(self, path, step, val_loss):
+        # Save in bf16 to match the base model dtype and keep distribution
+        # files small. Master weights live in fp32 under bf16-mixed precision
+        # (Lightning), so a one-shot cast here is safe.
+        flow_sd = {k: v.to(torch.bfloat16) for k, v in self.flow_fn.state_dict().items()}
         ckpt = {
-            "flow_fn": self.flow_fn.state_dict(),
+            "flow_fn": flow_sd,
             "step": step,
             "val_loss": val_loss,
         }
         if getattr(self.args, 'unfreeze_concept_enc', False):
-            ckpt["concept_enc"] = self.concept_enc.state_dict()
+            enc_sd = {k: v.to(torch.bfloat16) for k, v in self.concept_enc.state_dict().items()}
+            ckpt["concept_enc"] = enc_sd
         torch.save(ckpt, path)
 
     def on_validation_epoch_end(self):
@@ -469,16 +474,18 @@ def main():
         enable_checkpointing=False,  # we handle checkpointing manually
         accelerator="gpu",
         devices=1,
-        precision="32",
+        precision="bf16-mixed",
         log_every_n_steps=50,
     )
 
     trainer.fit(model, train_loader, val_loader)
 
-    # Save final standalone checkpoint
-    final_ckpt = {"flow_fn": model.flow_fn.state_dict()}
+    # Save final standalone checkpoint (bf16 to match base model dtype).
+    flow_sd = {k: v.to(torch.bfloat16) for k, v in model.flow_fn.state_dict().items()}
+    final_ckpt = {"flow_fn": flow_sd}
     if getattr(args, 'unfreeze_concept_enc', False):
-        final_ckpt["concept_enc"] = model.concept_enc.state_dict()
+        enc_sd = {k: v.to(torch.bfloat16) for k, v in model.concept_enc.state_dict().items()}
+        final_ckpt["concept_enc"] = enc_sd
     torch.save(final_ckpt, ckpt_dir / "final.pt")
     print(f"Done. Saved to {ckpt_dir}", flush=True)
 

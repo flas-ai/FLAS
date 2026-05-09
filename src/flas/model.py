@@ -356,10 +356,38 @@ class ConceptEncoder(nn.Module):
         for p in self.parameters():
             p.requires_grad = False
 
+    @classmethod
+    def from_base_model(cls, base_model, num_layers=2):
+        """Build a ConceptEncoder that shares modules with an already-loaded
+        base LLM (avoids loading a second copy of the embedding table and the
+        first `num_layers` decoder layers).
+
+        Inherits the base model's dtype and device. Use for inference; for
+        training, prefer the regular constructor since training-time gradient
+        flow into shared weights would mutate the frozen base LLM.
+        """
+        self = cls.__new__(cls)
+        nn.Module.__init__(self)
+        cfg = base_model.config
+        base = base_model.model  # Gemma2Model
+        self.embed_tokens = base.embed_tokens
+        self.layers = nn.ModuleList(list(base.layers[:num_layers]))
+        self.norm = base.norm
+        self.rotary_emb = base.rotary_emb
+        self.hidden_size = cfg.hidden_size
+        for p in self.parameters():
+            p.requires_grad = False
+        return self
+
     def forward(self, input_ids, attention_mask=None):
         bsz, seq_len = input_ids.shape
         h = self.embed_tokens(input_ids)
-        h = h * (self.hidden_size ** 0.5)
+        # In transformers >= 5.0, Gemma2's embed_tokens is a
+        # Gemma2TextScaledWordEmbedding that already applies the
+        # sqrt(hidden_size) scaling internally. In earlier versions it's a
+        # plain nn.Embedding and the caller has to scale manually.
+        if not hasattr(self.embed_tokens, "embed_scale"):
+            h = h * (self.hidden_size ** 0.5)
 
         position_ids = torch.arange(seq_len, device=h.device).unsqueeze(0)
         position_embeddings = self.rotary_emb(h, position_ids)

@@ -2,6 +2,7 @@ results/
 checkpoints/
 thirdparty/
 paper/
+.openai_key.sh
 uv.lock
 
 # Byte-compiled / optimized / DLL files
