@@ -10,6 +10,16 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from flas.model import FlowFunction, ConceptEncoder
 
 
+def _load_ckpt(path):
+    """Load weights from .safetensors or .pt. Returns a state_dict-like mapping
+    that may also contain a top-level 'flow_fn' / 'concept_enc' wrapper."""
+    p = str(path)
+    if p.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        return {"flow_fn": load_file(p, device="cpu")}
+    return torch.load(p, weights_only=True, map_location="cpu")
+
+
 class FlasGenerator:
     """Steered generation with ODE integration."""
 
@@ -19,6 +29,7 @@ class FlasGenerator:
         self.flow_fn = flow_fn
         self.concept_enc = concept_enc
         self.layer = layer
+        self._flow_dtype = next(flow_fn.parameters()).dtype
 
         # Hook state
         self._hook_handle = None
@@ -38,9 +49,9 @@ class FlasGenerator:
             return output
         is_tuple = isinstance(output, tuple)
         h_orig = output[0] if is_tuple else output
-        h = h_orig.float()
+        h = h_orig.to(self._flow_dtype)
         bsz = h.size(0)
-        dt = self._flowtimes[:bsz] / self._n_steps
+        dt = (self._flowtimes[:bsz] / self._n_steps).to(self._flow_dtype)
 
         for k in range(self._n_steps):
             t_k = dt * k
@@ -250,11 +261,15 @@ def load_generator(flow_ckpt, model_id=None, layer=None, num_blocks=None):
                            disable_self_attn=cfg.get("disable_self_attn", False),
                            disable_mlp=cfg.get("disable_mlp", False))
 
-    ckpt = torch.load(flow_ckpt, weights_only=True, map_location="cpu")
-    flow_fn.load_state_dict(ckpt["flow_fn"] if "flow_fn" in ckpt else ckpt)
+    ckpt = _load_ckpt(flow_ckpt)
+    sd = ckpt["flow_fn"] if "flow_fn" in ckpt else ckpt
+    target_dtype = next(iter(sd.values())).dtype
+    print(f"  flow weights dtype: {target_dtype}", flush=True)
+    flow_fn.to(target_dtype)
+    flow_fn.load_state_dict(sd)
     flow_fn = flow_fn.to("cuda").eval()
 
-    concept_enc = ConceptEncoder(model_id, num_layers=2).to("cuda")
+    concept_enc = ConceptEncoder(model_id, num_layers=2).to(target_dtype).to("cuda")
     if "concept_enc" in ckpt:
         concept_enc.load_state_dict(ckpt["concept_enc"])
 

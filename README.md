@@ -53,6 +53,17 @@ thirdparty/axbench/axbench/concept500/prod_2b_l20_v1/generate/
 └── metadata.jsonl
 ```
 
+## Hardware
+
+End-to-end inference VRAM (peak, 128-token generation, base model bf16, FLAS modules fp32):
+
+| Base model | Base (bf16) | FlowFunction | ConceptEncoder | **Inference peak** |
+|---|---:|---:|---:|---:|
+| Gemma-2-2B-IT | 4.9 GB | 0.4 GB | 2.9 GB | **~8.0 GB** |
+| Gemma-2-9B-IT | 17.2 GB | 1.0 GB | 4.9 GB | **~23.1 GB** |
+
+So a 12 GB GPU (RTX 3060, T4, etc.) is enough for the 2B checkpoint and a 24 GB GPU (RTX 3090 / 4090, A10G, L4) is the practical minimum for the 9B checkpoint. Training peaks higher than inference because of optimizer state and activations — the recipes below were run on a single 80 GB A100, but a single 24 GB consumer card is plenty for the 2B Concept500 setting.
+
 ## Quick start
 
 Train on Concept500 (single 18 GB+ GPU, Gemma-2-2B-IT):

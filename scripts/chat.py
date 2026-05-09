@@ -62,7 +62,8 @@ class InteractiveFlas:
                                     disable_cross_attn=cfg.get("disable_cross_attn", False),
                                     disable_self_attn=cfg.get("disable_self_attn", False),
                                     disable_mlp=cfg.get("disable_mlp", False))
-        ckpt = torch.load(args.flow_ckpt, weights_only=True, map_location="cpu")
+        from flas.generate import _load_ckpt
+        ckpt = _load_ckpt(args.flow_ckpt)
         self.flow_fn.load_state_dict(ckpt["flow_fn"] if "flow_fn" in ckpt else ckpt)
         self.flow_fn = self.flow_fn.to("cuda").eval()
 
@@ -252,7 +253,7 @@ def main():
             elif cmd == "/flowtime":
                 try:
                     chat.flowtime = float(arg)
-                    print(f"  Dose set to {chat.flowtime}")
+                    print(f"  Flowtime set to {chat.flowtime}")
                 except ValueError:
                     print("  Usage: /flowtime <number>")
             elif cmd == "/steps":

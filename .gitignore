@@ -1,6 +1,7 @@
 results/
 checkpoints/
 thirdparty/
+paper/
 uv.lock
 
 # Byte-compiled / optimized / DLL files
