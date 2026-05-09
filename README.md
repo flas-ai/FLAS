@@ -5,7 +5,7 @@
 [![arXiv](https://img.shields.io/badge/arXiv-2605.05892-b31b1b.svg)](https://arxiv.org/abs/2605.05892)
 [![🤗 Model — 2B](https://img.shields.io/badge/🤗%20Model-flas--gemma--2--2b--it-FFD21E)](https://huggingface.co/flas-ai/flas-gemma-2-2b-it)
 [![🤗 Model — 9B](https://img.shields.io/badge/🤗%20Model-flas--gemma--2--9b--it-FFD21E)](https://huggingface.co/flas-ai/flas-gemma-2-9b-it)
-[![🤗 Demo](https://img.shields.io/badge/🤗%20Spaces-flas--demo-FFD21E)](https://huggingface.co/spaces/flas-ai/flas-demo)
+[![🤗 Demo](https://img.shields.io/badge/🤗%20Spaces-flas--demo-FFD21E)](https://huggingface.co/spaces/Lunamos/flas-demo)
 
 FLAS learns a concept-conditioned velocity field $v_\theta(h, t, c)$ that transports an unsteered activation $h$ to a steered activation $h'$ by integrating a flow ODE. The flow time $T$ serves as a continuous steering-strength parameter; sampling $T \sim \mathrm{Uniform}[T_{\min}, T_{\max}]$ during training enables zero-shot strength control at inference. FLAS is the first learned steering method to consistently outperform in-context prompting on AxBench.
 
@@ -25,7 +25,7 @@ The flow time $T$ serves as a continuous steering-strength parameter; sampling $
 
 ### Try it online
 
-The hosted demo at <https://huggingface.co/spaces/flas-ai/flas-demo> runs Gemma-2-2B-IT with FLAS on a ZeroGPU slice. Type any concept (e.g. *"talk like a pirate"*) and a prompt, see the steered vs baseline output side-by-side.
+The hosted demo at <https://huggingface.co/spaces/Lunamos/flas-demo> runs Gemma-2-2B-IT with FLAS on a ZeroGPU slice. Type any concept (e.g. *"talk like a pirate"*) and a prompt, see the steered vs baseline output side-by-side.
 
 ### Pretrained checkpoints
 
