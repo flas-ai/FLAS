@@ -4,13 +4,11 @@
 
 [![Project Page](https://img.shields.io/badge/Project%20Page-flas--ai.github.io-4c1)](https://flas-ai.github.io)
 [![arXiv](https://img.shields.io/badge/arXiv-2605.05892-b31b1b.svg)](https://arxiv.org/abs/2605.05892)
-[![🤗 Model — 2B](https://img.shields.io/badge/🤗%20Model-flas--gemma--2--2b--it-FFD21E)](https://huggingface.co/flas-ai/flas-gemma-2-2b-it)
-[![🤗 Model — 9B](https://img.shields.io/badge/🤗%20Model-flas--gemma--2--9b--it-FFD21E)](https://huggingface.co/flas-ai/flas-gemma-2-9b-it)
+[![🤗 Model](https://img.shields.io/badge/🤗%20Model-flas--gemma--2-FFD21E)](https://huggingface.co/collections/flas-ai/flas)
 [![🤗 Demo](https://img.shields.io/badge/🤗%20Spaces-flas--demo-FFD21E)](https://huggingface.co/spaces/Lunamos/flas-demo)
 
-Activation steering has emerged as a promising alternative for controlling language-model behavior at inference time by modifying intermediate representations while keeping model parameters frozen. However, large-scale evaluations such as AxBench show that existing steering methods are often outperformed by simple in-context prompting and generalize poorly to unseen concepts. We hypothesize that these limitations arise from unvalidated simplifying assumptions shared across prior methods, which typically restrict steering interventions to fixed, single-step, position-invariant transforms.
+FLAS is a natural-language activation-steering method for LLMs. Where prior work like [*Golden Gate Claude*](https://www.anthropic.com/news/golden-gate-claude) had to lock in a single behavior in advance, FLAS learns a single general concept-conditioned velocity field $v_\theta(h, t, c)$. At inference you hand it any natural-language concept $c$ and it produces the right inference-time intervention. The same checkpoint handles thousands of unseen concepts.
 
-We propose FLAS (Flow-based Activation Steering), which learns a general, concept-conditioned velocity field $v_\theta(h, t, c)$ that transports unsteered activations to steered ones without relying on these assumptions. On AxBench, FLAS is the first learned method to consistently outperform prompting, reaching held-out harmonic means of $1.015$ on Gemma-2-2B-IT and $1.113$ on Gemma-2-9B-IT without per-concept tuning. Analysis of the learned flow shows curved, multi-step, token-varying trajectories, which suggests that previous hypotheses on activation space geometry might be incomplete.
 
 <p align="center">
   <img src="figs/main.png" width="90%" />
