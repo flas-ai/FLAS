@@ -7,7 +7,7 @@
 [![🤗 Model](https://img.shields.io/badge/🤗%20Model-flas--gemma--2-FFD21E)](https://huggingface.co/collections/flas-ai/flas)
 [![🤗 Demo](https://img.shields.io/badge/🤗%20Spaces-flas--demo-FFD21E)](https://huggingface.co/spaces/Lunamos/flas-demo)
 
-FLAS is a natural-language activation-steering method for LLMs. Where prior work like [*Golden Gate Claude*](https://www.anthropic.com/news/golden-gate-claude) had to lock in a single behavior in advance, FLAS learns a single general concept-conditioned velocity field $v_\theta(h, t, c)$. At inference you hand it any natural-language concept $c$ and it produces the right inference-time intervention. The same checkpoint handles thousands of unseen concepts.
+FLAS is a natural-language activation-steering method for LLMs. Where prior work like [*Golden Gate Claude*](https://www.anthropic.com/news/golden-gate-claude) had to lock in a single behavior in advance, FLAS learns a single general concept-conditioned velocity field $v_\theta(h, t, c)$. At inference you hand it any natural-language concept $c$ and it produces the right inference-time intervention. The same checkpoint handles thousands of unseen concepts, and is the first learned steering method to consistently outperform in-context prompting on AxBench.
 
 
 <p align="center">
