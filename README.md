@@ -2,6 +2,7 @@
 
 **Flow-based Activation Steering for Inference-Time Intervention.**
 
+[![Project Page](https://img.shields.io/badge/Project%20Page-flas--ai.github.io-4c1)](https://flas-ai.github.io)
 [![arXiv](https://img.shields.io/badge/arXiv-2605.05892-b31b1b.svg)](https://arxiv.org/abs/2605.05892)
 [![🤗 Model — 2B](https://img.shields.io/badge/🤗%20Model-flas--gemma--2--2b--it-FFD21E)](https://huggingface.co/flas-ai/flas-gemma-2-2b-it)
 [![🤗 Model — 9B](https://img.shields.io/badge/🤗%20Model-flas--gemma--2--9b--it-FFD21E)](https://huggingface.co/flas-ai/flas-gemma-2-9b-it)

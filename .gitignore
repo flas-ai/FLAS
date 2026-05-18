@@ -5,6 +5,14 @@ paper/
 .openai_key.sh
 uv.lock
 
+# data: whitelist only existing tracked files
+data/*
+!data/alpaca_eval.json
+!data/eval_c16k_2b_hi100.json
+!data/eval_c16k_2b_ho100.json
+!data/eval_c16k_9b_hi100.json
+!data/eval_c16k_9b_ho100.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
