@@ -22,6 +22,14 @@ $$h' = \varphi_T(h) = h + \int_0^T v_\theta\!\bigl(\varphi_t(h),\, t,\, c\bigr)\
 
 The flow time $T$ serves as a continuous steering-strength parameter; sampling $T \sim \mathrm{Uniform}[T_{\min}, T_{\max}]$ during training enables zero-shot strength control at inference. FLAS is the first learned steering method to consistently outperform in-context prompting on AxBench.
 
+## Results
+
+<p align="center">
+  <img src="figs/scores.png" width="90%" />
+</p>
+
+Evaluated on AxBench's Concept16k held-in / held-out splits with Gemma-2-2B-IT and Gemma-2-9B-IT, intervening at layer 20, fixed $T = 2$. Generations are scored by GPT-4o-mini on Concept / Instruction-following / Fluency and aggregated into HMean. See the [paper](https://arxiv.org/abs/2605.05892) for full tables, baselines, and ablations.
+
 ## Get started
 
 ### Try it online
