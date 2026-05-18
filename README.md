@@ -8,7 +8,9 @@
 [![🤗 Model — 9B](https://img.shields.io/badge/🤗%20Model-flas--gemma--2--9b--it-FFD21E)](https://huggingface.co/flas-ai/flas-gemma-2-9b-it)
 [![🤗 Demo](https://img.shields.io/badge/🤗%20Spaces-flas--demo-FFD21E)](https://huggingface.co/spaces/Lunamos/flas-demo)
 
-FLAS learns a concept-conditioned velocity field $v_\theta(h, t, c)$ that transports an unsteered activation $h$ to a steered activation $h'$ by integrating a flow ODE. The flow time $T$ serves as a continuous steering-strength parameter; sampling $T \sim \mathrm{Uniform}[T_{\min}, T_{\max}]$ during training enables zero-shot strength control at inference. FLAS is the first learned steering method to consistently outperform in-context prompting on AxBench.
+Activation steering has emerged as a promising alternative for controlling language-model behavior at inference time by modifying intermediate representations while keeping model parameters frozen. However, large-scale evaluations such as AxBench show that existing steering methods are often outperformed by simple in-context prompting and generalize poorly to unseen concepts. We hypothesize that these limitations arise from unvalidated simplifying assumptions shared across prior methods, which typically restrict steering interventions to fixed, single-step, position-invariant transforms.
+
+We propose FLAS (Flow-based Activation Steering), which learns a general, concept-conditioned velocity field $v_\theta(h, t, c)$ that transports unsteered activations to steered ones without relying on these assumptions. On AxBench, FLAS is the first learned method to consistently outperform prompting, reaching held-out harmonic means of $1.015$ on Gemma-2-2B-IT and $1.113$ on Gemma-2-9B-IT without per-concept tuning. Analysis of the learned flow shows curved, multi-step, token-varying trajectories, which suggests that previous hypotheses on activation space geometry might be incomplete.
 
 <p align="center">
   <img src="figs/main.png" width="90%" />
@@ -16,11 +18,11 @@ FLAS learns a concept-conditioned velocity field $v_\theta(h, t, c)$ that transp
 
 ## How it works
 
-FLAS learns a concept-conditioned velocity field $v_\theta(h, t, c)$ that transports an unsteered activation $h$ to a steered activation $h'$ by integrating a flow ODE:
+FLAS learns a concept-conditioned velocity field $v_\theta(h, t, c)$ that transports an unsteered activation $h$ to a steered activation $h'$:
 
-$$h' = \varphi_T(h) = h + \int_0^T v_\theta\!\bigl(\varphi_t(h),\, t,\, c\bigr)\, dt$$
+$$h' = \varphi_T(h) = h + \int_0^T v_\theta\bigl(\varphi_t(h), t, c\bigr) dt$$
 
-The flow time $T$ serves as a continuous steering-strength parameter; sampling $T \sim \mathrm{Uniform}[T_{\min}, T_{\max}]$ during training enables zero-shot strength control at inference. FLAS is the first learned steering method to consistently outperform in-context prompting on AxBench.
+The flow time $T$ serves as a continuous steering-strength parameter and enables zero-shot strength control at inference.
 
 ## Results
 
