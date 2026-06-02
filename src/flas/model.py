@@ -5,24 +5,54 @@
   velocity v(h, t, c) used by the N-step Euler integrator.
 - FlowBlock: TimeEmbed -> CrossAttn(Q=h, KV=concept) -> Causal SelfAttn -> MLP,
   each wrapped with a residual connection and a learnable per-channel gate.
+
+Multi-family support
+--------------------
+The FlowBlock *structure* is fixed across model families; only the underlying
+nn modules (RMSNorm / RotaryEmbedding / Attention) and a few config-derived
+behaviors vary. These are resolved once per model by ``get_arch_spec(config)``
+keyed on ``config.model_type`` (gemma2, qwen3, ...). To add a family, add one
+registry entry — no changes to the block/encoder logic.
+
+``FlowCrossAttention`` is deliberately family-agnostic: it has no module-level
+import of any family's classes. The RMSNorm class and a RoPE instance are
+injected by the caller (cross-attention is not a component the base model has,
+so it should not depend on a specific family's modeling module). The RoPE math
+(``rotate_half``) and GQA expansion (``repeat_kv``) are identical across
+families and defined locally.
 """
 
 import math
-from typing import Optional, List, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, List, Tuple, Callable, Dict, Type
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoConfig
+from transformers.activations import ACT2FN
 from transformers.cache_utils import DynamicCache
-from transformers.models.gemma2.modeling_gemma2 import (
-    Gemma2RMSNorm,
-    Gemma2RotaryEmbedding,
-    Gemma2Attention,
-    apply_rotary_pos_emb,
-    repeat_kv,
-    rotate_half,
-)
+
+
+# ---------------------------------------------------------------------------
+# Family-independent RoPE / GQA helpers (identical across gemma2/qwen3/llama)
+# ---------------------------------------------------------------------------
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input (standard RoPE)."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def repeat_kv(hidden_states, n_rep):
+    """Expand KV heads to match Q heads for GQA."""
+    batch, num_kv_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_kv_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
 
 
 def _apply_rope_single(x, cos, sin, unsqueeze_dim=1):
@@ -32,33 +62,210 @@ def _apply_rope_single(x, cos, sin, unsqueeze_dim=1):
     return (x * cos) + (rotate_half(x) * sin)
 
 
+class _RopeLayerTypeWrapper(nn.Module):
+    """Adapt a layer-type-keyed RoPE (Gemma3RotaryEmbedding) to the standard
+    rope(x, position_ids) -> (cos, sin) call used by FlowCrossAttention."""
+
+    def __init__(self, rope, layer_type):
+        super().__init__()
+        self.rope = rope
+        self.layer_type = layer_type
+
+    def forward(self, x, position_ids):
+        return self.rope(x, position_ids, layer_type=self.layer_type)
+
+
 # ---------------------------------------------------------------------------
-# Cross-attention (Gemma2 GQA with RoPE, QK norm, softcapping)
+# Architecture registry
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ArchSpec:
+    """Per-family modules + config-derived behaviors for the FlowFunction.
+
+    Fields:
+        rms_norm_cls:  family RMSNorm class, ``cls(dim, eps=...)``.
+        rotary_emb_cls: family RotaryEmbedding class, ``cls(config=config)``.
+        attention_cls: family causal-attention class for the self-attn phase.
+        embed_scale:   whether token embeddings are scaled by sqrt(hidden)
+                       (Gemma family) — only applied when the embedding layer
+                       does not already scale internally.
+        needs_layer_types: whether a fresh-from-dict config must have
+                       ``layer_types`` repopulated (Qwen3/Llama).
+        self_attn_layer_idx_fn: maps the target layer index to the layer_idx
+                       passed to the self-attn module (controls sliding/global
+                       selection; Gemma2 alternates by parity, others use 0).
+        norm_init_map: maps FlowBlock norm attribute -> source decoder-layer
+                       norm attribute (or None to leave at default weight=1)
+                       when initializing from the base model's layer.
+    """
+    rms_norm_cls: Type[nn.Module]
+    rotary_emb_cls: Type[nn.Module]
+    attention_cls: Type[nn.Module]
+    embed_scale: bool
+    needs_layer_types: bool
+    self_attn_layer_idx_fn: Callable[[int], int]
+    norm_init_map: Dict[str, Optional[str]]
+    # Gemma3's RotaryEmbedding holds per-layer-type inv_freqs (global vs local
+    # sliding) and requires a `layer_type` arg. When set, the rope is called as
+    # rope(x, pos, layer_type=...). None = standard single rope(x, pos).
+    rope_layer_type: Optional[str] = None
+
+
+def _gemma2_spec():
+    from transformers.models.gemma2.modeling_gemma2 import (
+        Gemma2RMSNorm, Gemma2RotaryEmbedding, Gemma2Attention)
+    return ArchSpec(
+        rms_norm_cls=Gemma2RMSNorm,
+        rotary_emb_cls=Gemma2RotaryEmbedding,
+        attention_cls=Gemma2Attention,
+        embed_scale=True,
+        needs_layer_types=False,
+        # Gemma2 alternates sliding (even) / global (odd) attention per layer;
+        # replicate the target layer's behavior by its parity.
+        self_attn_layer_idx_fn=lambda layer_idx: layer_idx % 2,
+        norm_init_map={
+            "pre_sa_norm": "input_layernorm",
+            "post_sa_norm": "post_attention_layernorm",
+            "pre_mlp_norm": "pre_feedforward_layernorm",
+            "post_mlp_norm": "post_feedforward_layernorm",
+        },
+    )
+
+
+def _qwen3_spec():
+    from transformers.models.qwen3.modeling_qwen3 import (
+        Qwen3RMSNorm, Qwen3RotaryEmbedding, Qwen3Attention)
+    return ArchSpec(
+        rms_norm_cls=Qwen3RMSNorm,
+        rotary_emb_cls=Qwen3RotaryEmbedding,
+        attention_cls=Qwen3Attention,
+        embed_scale=False,
+        needs_layer_types=True,
+        # Qwen3 uses full_attention everywhere (no sliding alternation).
+        self_attn_layer_idx_fn=lambda layer_idx: 0,
+        # Qwen3 has only 2 norms per layer: input_layernorm (pre-attn) and
+        # post_attention_layernorm (really pre-MLP). No post norms — the
+        # FlowBlock keeps post_sa/post_mlp norms at default (weight=1), absorbed
+        # by the learnable per-feature gates.
+        norm_init_map={
+            "pre_sa_norm": "input_layernorm",
+            "post_sa_norm": None,
+            "pre_mlp_norm": "post_attention_layernorm",
+            "post_mlp_norm": None,
+        },
+    )
+
+
+def _llama_spec():
+    from transformers.models.llama.modeling_llama import (
+        LlamaRMSNorm, LlamaRotaryEmbedding, LlamaAttention)
+    return ArchSpec(
+        rms_norm_cls=LlamaRMSNorm,
+        rotary_emb_cls=LlamaRotaryEmbedding,
+        attention_cls=LlamaAttention,
+        embed_scale=False,
+        needs_layer_types=True,
+        self_attn_layer_idx_fn=lambda layer_idx: 0,
+        norm_init_map={
+            "pre_sa_norm": "input_layernorm",
+            "post_sa_norm": None,
+            "pre_mlp_norm": "post_attention_layernorm",
+            "post_mlp_norm": None,
+        },
+    )
+
+
+def _gemma3_spec():
+    from transformers.models.gemma3.modeling_gemma3 import (
+        Gemma3RMSNorm, Gemma3RotaryEmbedding, Gemma3Attention)
+    return ArchSpec(
+        rms_norm_cls=Gemma3RMSNorm,
+        rotary_emb_cls=Gemma3RotaryEmbedding,
+        attention_cls=Gemma3Attention,
+        embed_scale=True,  # Gemma family scales embeddings (handled in-layer if scaled embedding)
+        needs_layer_types=True,  # gemma3 alternates sliding/full; force full for the (unused) self-attn build
+        self_attn_layer_idx_fn=lambda layer_idx: 0,
+        # Gemma3 keeps gemma2's 4-norm layout (pre/post around attn and MLP).
+        norm_init_map={
+            "pre_sa_norm": "input_layernorm",
+            "post_sa_norm": "post_attention_layernorm",
+            "pre_mlp_norm": "pre_feedforward_layernorm",
+            "post_mlp_norm": "post_feedforward_layernorm",
+        },
+        # Cross-attn uses the global rope (FLAS cross-attn is a learned module,
+        # not tied to a specific decoder layer's sliding/global type).
+        rope_layer_type="full_attention",
+    )
+
+
+_ARCH_REGISTRY: Dict[str, Callable[[], ArchSpec]] = {
+    "gemma2": _gemma2_spec,
+    "qwen3": _qwen3_spec,
+    "llama": _llama_spec,
+    "gemma3": _gemma3_spec,
+    "gemma3_text": _gemma3_spec,
+}
+
+
+def get_arch_spec(config) -> ArchSpec:
+    mt = getattr(config, "model_type", None)
+    if mt not in _ARCH_REGISTRY:
+        raise ValueError(
+            f"Unsupported model_type {mt!r}. Supported: "
+            f"{sorted(_ARCH_REGISTRY)}. Add a registry entry in model.py.")
+    return _ARCH_REGISTRY[mt]()
+
+
+def get_text_config(config):
+    """Unwrap the text sub-config for multimodal models (gemma3-4b nests the
+    decoder config under `.text_config`); pass-through for text-only models."""
+    return getattr(config, "text_config", None) or config
+
+
+def get_text_decoder(model):
+    """Return the text decoder module exposing .layers/.embed_tokens/.norm/
+    .rotary_emb. Multimodal wrappers (gemma3-4b Gemma3ForConditionalGeneration)
+    nest it under model.model.language_model; text-only models expose it at
+    model.model."""
+    base = model.model
+    if hasattr(base, "language_model"):
+        return base.language_model
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Cross-attention (family-agnostic; norm class + RoPE injected by caller)
 # ---------------------------------------------------------------------------
 
 class FlowCrossAttention(nn.Module):
-    """Cross-attention with Gemma2 GQA config.
-    RoPE applied to both Q and K sides.
+    """GQA cross-attention: activation queries (Q=h) attend to encoded concept
+    (KV). RoPE applied to both Q and K sides. QK-norm applied per head_dim.
+
+    Family-agnostic: ``rms_norm_cls`` and ``rotary_emb`` are injected so this
+    module does not import any family's modeling classes. Optional logit
+    softcapping (Gemma family) via ``softcap``.
     """
 
-    def __init__(self, config):
+    def __init__(self, *, hidden_size, num_heads, num_kv_heads, head_dim,
+                 rms_norm_eps, rotary_emb, rms_norm_cls,
+                 attn_bias=False, softcap=None):
         super().__init__()
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = config.head_dim
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
         self.num_kv_groups = self.num_heads // self.num_kv_heads
         self.scaling = self.head_dim ** -0.5
-        self.softcap = config.attn_logit_softcapping
-        hidden_size = config.hidden_size
+        self.softcap = softcap
 
-        self.q_proj = nn.Linear(hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, hidden_size, bias=False)
+        self.q_proj = nn.Linear(hidden_size, self.num_heads * self.head_dim, bias=attn_bias)
+        self.k_proj = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=attn_bias)
+        self.v_proj = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=attn_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, hidden_size, bias=attn_bias)
 
-        self.q_norm = Gemma2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Gemma2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.rotary_emb = Gemma2RotaryEmbedding(config=config)
+        self.q_norm = rms_norm_cls(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = rms_norm_cls(self.head_dim, eps=rms_norm_eps)
+        self.rotary_emb = rotary_emb
 
     def forward(self, hidden_states, encoder_hidden_states,
                 encoder_attention_mask=None, q_pos_offset=0,
@@ -66,15 +273,15 @@ class FlowCrossAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
         kv_len = encoder_hidden_states.size(1)
 
-        q = self.q_proj(hidden_states)
-        q = q.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        q = self.q_norm(q)
+        # Norm-then-reshape: q_norm/k_norm normalize the last dim (head_dim).
+        q = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
+        q = self.q_norm(q).transpose(1, 2)  # [B, H, Q, D]
 
-        k = self.k_proj(encoder_hidden_states)
-        v = self.v_proj(encoder_hidden_states)
-        k = k.view(bsz, kv_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, kv_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        k = self.k_norm(k)
+        k = self.k_proj(encoder_hidden_states).view(bsz, kv_len, self.num_kv_heads, self.head_dim)
+        k = self.k_norm(k).transpose(1, 2)  # [B, Hkv, K, D]
+
+        v = self.v_proj(encoder_hidden_states).view(bsz, kv_len, self.num_kv_heads, self.head_dim)
+        v = v.transpose(1, 2)
 
         # RoPE — prefer explicit per-sample position_ids (correct for left-padded
         # batches); fall back to arange + offset for training/same-length batches.
@@ -104,8 +311,7 @@ class FlowCrossAttention(nn.Module):
 
         if encoder_attention_mask is not None:
             mask = encoder_attention_mask[:, None, None, :]
-            # Direct fill with -1e4 (softcap keeps valid logits in [-30, 30],
-            # so -1e4 dominates; avoids -inf arithmetic).
+            # Direct fill with -1e4: dominates valid logits without -inf arithmetic.
             attn_weights = attn_weights.masked_fill(mask == 0, -1e4)
 
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
@@ -149,7 +355,7 @@ class TimeEmbedder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# FlowBlock: cross-attention + MLP + causal self-attention
+# FlowBlock: cross-attention + causal self-attention + MLP
 # ---------------------------------------------------------------------------
 
 class FlowBlock(nn.Module):
@@ -161,41 +367,65 @@ class FlowBlock(nn.Module):
     cached once outside the block and reused across all integration steps.
     """
 
-    def __init__(self, config, init_gate=0.1, layer_idx=0,
-                 disable_cross_attn=False,
+    def __init__(self, config, spec: ArchSpec, rotary_emb, init_gate=0.1,
+                 layer_idx=0, disable_cross_attn=False,
                  disable_self_attn=False, disable_mlp=False):
         super().__init__()
         hidden_size = config.hidden_size
         intermediate_size = config.intermediate_size
         rms_norm_eps = config.rms_norm_eps
+        RMSNorm = spec.rms_norm_cls
         self.layer_idx = layer_idx
         self.disable_cross_attn = disable_cross_attn
         self.disable_self_attn = disable_self_attn
         self.disable_mlp = disable_mlp
 
+        head_dim = getattr(config, "head_dim",
+                           config.hidden_size // config.num_attention_heads)
+        attn_bias = getattr(config, "attention_bias", False)
+        softcap = getattr(config, "attn_logit_softcapping", None)
+
         # Cross-attention: activation queries the encoded concept.
-        self.pre_cross_norm = Gemma2RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.cross_attn = FlowCrossAttention(config)
-        self.post_cross_norm = Gemma2RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.pre_cross_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self.cross_attn = FlowCrossAttention(
+            hidden_size=hidden_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=config.num_key_value_heads,
+            head_dim=head_dim,
+            rms_norm_eps=rms_norm_eps,
+            rotary_emb=rotary_emb,
+            rms_norm_cls=RMSNorm,
+            attn_bias=attn_bias,
+            softcap=softcap)
+        self.post_cross_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.cross_gate = nn.Parameter(torch.full((hidden_size,), init_gate))
 
-        # Causal self-attention (Gemma2Attention) on the activation stream.
-        sa_config = type(config).from_dict(config.to_dict())
-        sa_config._attn_implementation = "eager"
-        self.pre_sa_norm = Gemma2RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.post_sa_norm = Gemma2RMSNorm(hidden_size, eps=rms_norm_eps)
-        # Gemma2 alternates sliding (even) / global (odd) attention per layer;
-        # layer_idx % 2 replicates the behavior of the target layer.
-        self.self_attn = Gemma2Attention(sa_config, layer_idx=layer_idx % 2)
-        self.self_attn_gate = nn.Parameter(torch.full((hidden_size,), init_gate))
+        # Causal self-attention (family Attention) on the activation stream.
+        # Only built when enabled — the no-self-attn baseline skips it entirely
+        # (leaner checkpoints, and families whose self-attn we don't clone, e.g.
+        # gemma3 with its dual-rope sliding attention, never need to build it).
+        if not disable_self_attn:
+            sa_config = type(config).from_dict(config.to_dict())
+            sa_config._attn_implementation = "eager"
+            if spec.needs_layer_types:
+                # Fresh-from-dict configs may drop layer_types; repopulate so the
+                # attention module resolves a valid (full) attention type.
+                sa_config.layer_types = ["full_attention"] * sa_config.num_hidden_layers
+            self.pre_sa_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+            self.post_sa_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+            sa_layer_idx = spec.self_attn_layer_idx_fn(layer_idx)
+            self.self_attn = spec.attention_cls(sa_config, layer_idx=sa_layer_idx)
+            self.self_attn_gate = nn.Parameter(torch.full((hidden_size,), init_gate))
 
-        # Gemma-style gated MLP (gate + up + down proj, GELU-tanh).
-        self.pre_mlp_norm = Gemma2RMSNorm(hidden_size, eps=rms_norm_eps)
+        # Gated MLP (gate + up + down proj), family activation.
+        self.pre_mlp_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.post_mlp_norm = Gemma2RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.act_fn = nn.GELU(approximate='tanh')
+        self.post_mlp_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        # Qwen3/Llama use `hidden_act`; the Gemma family uses `hidden_activation`.
+        act_name = getattr(config, "hidden_act", None) or getattr(config, "hidden_activation", None)
+        self.act_fn = ACT2FN[act_name]
         self.mlp_gate = nn.Parameter(torch.full((hidden_size,), init_gate))
 
     def forward(self, h, concept_hidden, concept_mask=None,
@@ -217,7 +447,7 @@ class FlowBlock(nn.Module):
             ca_delta = self.post_cross_norm(ca_delta)
             h = h + self.cross_gate * ca_delta
 
-        # Causal self-attention (Gemma2Attention).
+        # Causal self-attention.
         if self.disable_self_attn:
             new_cache = self_attn_cache if use_cache else None
         else:
@@ -245,9 +475,10 @@ class FlowBlock(nn.Module):
 
             sa_out = self.self_attn(
                 h_normed_sa,
-                attention_mask=causal_mask,
                 position_embeddings=position_embeddings,
+                attention_mask=causal_mask,
                 past_key_values=self_attn_cache,
+                cache_position=None,
             )
             sa_delta = sa_out[0]
             # Cache is updated in-place by past_key_values.update()
@@ -255,7 +486,7 @@ class FlowBlock(nn.Module):
             sa_delta = self.post_sa_norm(sa_delta)
             h = h + self.self_attn_gate * sa_delta
 
-        # Gemma-style gated MLP.
+        # Gated MLP.
         if not self.disable_mlp:
             x = self.pre_mlp_norm(h)
             x = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -277,6 +508,7 @@ class FlowFunction(nn.Module):
                  disable_self_attn=False, disable_mlp=False):
         super().__init__()
         self.config = config
+        self.spec = get_arch_spec(config)
         self.hidden_size = config.hidden_size
         self.num_blocks = num_blocks
         self.time_conditioned = time_conditioned
@@ -284,12 +516,19 @@ class FlowFunction(nn.Module):
         if time_conditioned:
             self.time_embed = TimeEmbedder(config.hidden_size)
 
+        # One shared RoPE instance: feeds the self-attn phase (via
+        # position_embeddings) and is injected into each block's cross-attn.
+        base_rope = self.spec.rotary_emb_cls(config=config)
+        if self.spec.rope_layer_type is not None:
+            self.rotary_emb = _RopeLayerTypeWrapper(base_rope, self.spec.rope_layer_type)
+        else:
+            self.rotary_emb = base_rope
+
         self.blocks = nn.ModuleList(
-            [FlowBlock(config, layer_idx=layer_idx,
+            [FlowBlock(config, self.spec, self.rotary_emb, layer_idx=layer_idx,
                        disable_cross_attn=disable_cross_attn,
                        disable_self_attn=disable_self_attn, disable_mlp=disable_mlp)
              for _ in range(num_blocks)])
-        self.rotary_emb = Gemma2RotaryEmbedding(config=config)
 
     def forward(self, h, concept_hidden, concept_mask=None, t=None,
                 self_attn_caches=None,
@@ -329,26 +568,31 @@ class FlowFunction(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Concept encoder (frozen 2-layer Gemma)
+# Concept encoder (frozen N-layer base model)
 # ---------------------------------------------------------------------------
 
 class ConceptEncoder(nn.Module):
-    """Frozen 2-layer Gemma encoder for steering prompt text."""
+    """Frozen N-layer base-model encoder for the steering prompt text."""
 
     def __init__(self, model_id="google/gemma-2-2b-it", num_layers=2):
         super().__init__()
-        config = AutoConfig.from_pretrained(model_id)
+        config = get_text_config(AutoConfig.from_pretrained(model_id))
+        self.spec = get_arch_spec(config)
+        # Force eager attention for compatibility with our additive 4D mask.
         full_model = AutoModelForCausalLM.from_pretrained(
-            model_id, torch_dtype=torch.float32)
+            model_id, torch_dtype=torch.float32, attn_implementation="eager")
+        base = get_text_decoder(full_model)
 
-        self.embed_tokens = full_model.model.embed_tokens
+        self.embed_tokens = base.embed_tokens
         self.layers = nn.ModuleList([
-            full_model.model.layers[i] for i in range(num_layers)
+            base.layers[i] for i in range(num_layers)
         ])
-        self.norm = Gemma2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm.load_state_dict(full_model.model.norm.state_dict())
+        self.norm = self.spec.rms_norm_cls(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm.load_state_dict(base.norm.state_dict())
         self.hidden_size = config.hidden_size
-        self.rotary_emb = full_model.model.rotary_emb
+        self.rotary_emb = base.rotary_emb
+        # Per-layer attention type (gemma3 sliding/full) for dual-rope dispatch.
+        self._layer_types = list(getattr(config, "layer_types", None) or [])[:num_layers]
 
         del full_model
         torch.cuda.empty_cache()
@@ -368,13 +612,15 @@ class ConceptEncoder(nn.Module):
         """
         self = cls.__new__(cls)
         nn.Module.__init__(self)
-        cfg = base_model.config
-        base = base_model.model  # Gemma2Model
+        cfg = get_text_config(base_model.config)
+        self.spec = get_arch_spec(cfg)
+        base = get_text_decoder(base_model)
         self.embed_tokens = base.embed_tokens
         self.layers = nn.ModuleList(list(base.layers[:num_layers]))
         self.norm = base.norm
         self.rotary_emb = base.rotary_emb
         self.hidden_size = cfg.hidden_size
+        self._layer_types = list(getattr(cfg, "layer_types", None) or [])[:num_layers]
         for p in self.parameters():
             p.requires_grad = False
         return self
@@ -382,17 +628,18 @@ class ConceptEncoder(nn.Module):
     def forward(self, input_ids, attention_mask=None):
         bsz, seq_len = input_ids.shape
         h = self.embed_tokens(input_ids)
-        # In transformers >= 5.0, Gemma2's embed_tokens is a
-        # Gemma2TextScaledWordEmbedding that already applies the
-        # sqrt(hidden_size) scaling internally. In earlier versions it's a
-        # plain nn.Embedding and the caller has to scale manually.
-        if not hasattr(self.embed_tokens, "embed_scale"):
+        # Gemma scales embeddings by sqrt(hidden_size); Qwen3/Llama do not.
+        # In transformers >= 5.0 Gemma2's embed_tokens is a
+        # Gemma2TextScaledWordEmbedding that already applies the scaling; only
+        # scale manually when the embedding layer does not.
+        if self.spec.embed_scale and not hasattr(self.embed_tokens, "embed_scale"):
             h = h * (self.hidden_size ** 0.5)
 
         position_ids = torch.arange(seq_len, device=h.device).unsqueeze(0)
-        position_embeddings = self.rotary_emb(h, position_ids)
 
-        # Causal + padding mask
+        # Causal + padding mask. For gemma3 sliding layers, sliding_window
+        # (512) >> concept length (<=64), so the sliding mask reduces to the
+        # plain causal mask — one mask works for both layer types here.
         MIN_VAL = torch.finfo(h.dtype).min
         causal = torch.triu(
             torch.full((seq_len, seq_len), MIN_VAL, device=h.device, dtype=h.dtype),
@@ -403,10 +650,23 @@ class ConceptEncoder(nn.Module):
         else:
             mask_4d = causal.expand(bsz, -1, -1, -1)
 
-        for layer in self.layers:
-            out = layer(h, attention_mask=mask_4d, position_ids=position_ids,
-                        position_embeddings=position_embeddings)
-            h = out[0] if isinstance(out, tuple) else out
+        # Gemma3's RoPE is keyed by layer type (global vs local sliding); feed
+        # each frozen layer the position embeddings for its own type. Other
+        # families use a single rope for all layers.
+        if self.spec.rope_layer_type is not None and self._layer_types:
+            pe_by_type = {lt: self.rotary_emb(h, position_ids, layer_type=lt)
+                          for lt in set(self._layer_types)}
+            for layer, lt in zip(self.layers, self._layer_types):
+                out = layer(h, attention_mask=mask_4d, position_ids=position_ids,
+                            position_embeddings=pe_by_type[lt])
+                h = out[0] if isinstance(out, tuple) else out
+        else:
+            position_embeddings = self.rotary_emb(h, position_ids)
+            for layer in self.layers:
+                # Gemma2DecoderLayer returns a tuple; Qwen3/Llama return a Tensor.
+                out = layer(h, attention_mask=mask_4d, position_ids=position_ids,
+                            position_embeddings=position_embeddings)
+                h = out[0] if isinstance(out, tuple) else out
 
         return self.norm(h)
 
@@ -427,8 +687,19 @@ def build_flow_model(model_id="google/gemma-2-2b-it", layer=20, num_blocks=2,
                      time_conditioned=True, init_from_gemma=True,
                      disable_cross_attn=False,
                      disable_self_attn=False, disable_mlp=False):
-    """Build FlowFunction + ConceptEncoder."""
-    config = AutoConfig.from_pretrained(model_id)
+    """Build FlowFunction + ConceptEncoder.
+
+    ``init_from_gemma`` is kept as the kwarg name for backward compat with the
+    train.py CLI (``--no-gemma-mlp-init``); it now means "init the FlowBlocks
+    (MLP + self-attn + pre/post norms) from the chosen LLM's layer-N weights"
+    regardless of architecture.
+    """
+    config = get_text_config(AutoConfig.from_pretrained(model_id))
+    spec = get_arch_spec(config)
+    if not disable_self_attn and str(getattr(config, "model_type", "")).startswith("gemma3"):
+        raise ValueError(
+            "gemma3 self-attention is not supported in FlowBlock (its dual-rope "
+            "sliding attention is not cloned). Run gemma3 with --disable-self-attn.")
     flow_fn = FlowFunction(config, num_blocks=num_blocks,
                            time_conditioned=time_conditioned,
                            layer_idx=layer,
@@ -437,20 +708,25 @@ def build_flow_model(model_id="google/gemma-2-2b-it", layer=20, num_blocks=2,
                            disable_mlp=disable_mlp)
 
     if init_from_gemma:
-        print(f"Initializing FlowFunction ({num_blocks} blocks) from Gemma layer {layer}...")
-        full_model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
-        src_layer = full_model.model.layers[layer]
+        print(f"Initializing FlowFunction ({num_blocks} blocks) from {model_id} layer {layer}...")
+        full_model = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.float32, attn_implementation="eager")
+        src_layer = get_text_decoder(full_model).layers[layer]
         for block in flow_fn.blocks:
-            # MLP from Gemma
+            # MLP from the base layer.
             block.gate_proj.load_state_dict(src_layer.mlp.gate_proj.state_dict())
             block.up_proj.load_state_dict(src_layer.mlp.up_proj.state_dict())
             block.down_proj.load_state_dict(src_layer.mlp.down_proj.state_dict())
-            block.pre_mlp_norm.load_state_dict(src_layer.pre_feedforward_layernorm.state_dict())
-            block.post_mlp_norm.load_state_dict(src_layer.post_feedforward_layernorm.state_dict())
-            # Self-attention from Gemma (only the attention part, not MLP)
-            block.self_attn.load_state_dict(src_layer.self_attn.state_dict())
-            block.pre_sa_norm.load_state_dict(src_layer.input_layernorm.state_dict())
-            block.post_sa_norm.load_state_dict(src_layer.post_attention_layernorm.state_dict())
+            # Self-attention (exact module match) — only when built.
+            if not disable_self_attn:
+                block.self_attn.load_state_dict(src_layer.self_attn.state_dict())
+            # Norms per the family's norm_init_map (None -> default; skip any
+            # norm the block doesn't have, e.g. sa-norms when self-attn is off).
+            for dst_attr, src_attr in spec.norm_init_map.items():
+                if src_attr is None or not hasattr(block, dst_attr):
+                    continue
+                getattr(block, dst_attr).load_state_dict(
+                    getattr(src_layer, src_attr).state_dict())
         del full_model
         torch.cuda.empty_cache()
     else:
@@ -460,15 +736,16 @@ def build_flow_model(model_id="google/gemma-2-2b-it", layer=20, num_blocks=2,
             _xavier_init_linear(block.gate_proj)
             _xavier_init_linear(block.up_proj)
             _xavier_init_linear(block.down_proj)
-            # Xavier init self-attn projections
-            for name, module in block.self_attn.named_modules():
-                _xavier_init_linear(module)
+            # Xavier init self-attn projections (only when built)
+            if not disable_self_attn:
+                for name, module in block.self_attn.named_modules():
+                    _xavier_init_linear(module)
 
     n_params = sum(p.numel() for p in flow_fn.parameters())
     n_trainable = sum(p.numel() for p in flow_fn.parameters() if p.requires_grad)
     print(f"FlowFunction: {n_params / 1e6:.1f}M params ({n_trainable / 1e6:.1f}M trainable)")
 
-    print("Building ConceptEncoder (2-layer Gemma, frozen)...")
+    print(f"Building ConceptEncoder (2-layer {config.model_type}, frozen)...")
     concept_enc = ConceptEncoder(model_id, num_layers=2)
 
     return flow_fn, concept_enc

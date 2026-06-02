@@ -16,6 +16,13 @@ We propose FLAS (Flow-based Activation Steering), which learns a general, concep
   <img src="figs/main.png" width="90%" />
 </p>
 
+> **This repository provides a unified, multi-family implementation of FLAS.** Beyond the
+> Gemma-2 models from the paper, the same flow-based steerer trains on **Qwen3**, **Llama-3.1**,
+> and **Gemma-3** (base or instruct) through a model-type registry — adding a new family is a
+> single registry entry. The FlowBlock also supports an optional self-attention ablation, and
+> training scales to larger concept corpora (FLAS-46k). The checkpoints and results below are
+> the paper's Gemma-2 artifacts; the other families are trained from scratch with the same recipe.
+
 ## How it works
 
 FLAS learns a concept-conditioned velocity field $v_\theta(h, t, c)$ that transports an unsteered activation $h$ to a steered activation $h'$:
@@ -101,6 +108,22 @@ print(out[0]["generation"])
 
 The base LLM (Gemma-2-2B-IT or Gemma-2-9B-IT) is downloaded from Hugging Face on first use; make sure you have run `hf auth login` and accepted the Gemma-2 license.
 
+## Supported base models
+
+The flow steerer is family-agnostic. A model-type registry in `src/flas/model.py` injects each family's
+norm / rotary / attention modules into the shared `FlowCrossAttention`, so the same `FlowFunction` trains on
+any of the families below — select one with `--model-id`:
+
+| Family | Example `--model-id` | Notes |
+|---|---|---|
+| Gemma-2 | `google/gemma-2-2b-it`, `google/gemma-2-9b-it` | paper models; released checkpoints |
+| Gemma-3 | `google/gemma-3-4b-it`, `google/gemma-3-4b-pt` | multimodal config auto-unwrapped to its text decoder; run with `--disable-self-attn` |
+| Qwen3 | `Qwen/Qwen3-8B`, `Qwen/Qwen3-8B-Base` | |
+| Llama-3.1 | `meta-llama/Llama-3.1-8B-Instruct`, `meta-llama/Llama-3.1-8B` | |
+
+Adding a new family is a single registry entry. The steering layer is selected with `--layer`, the number of
+FlowBlocks with `--num-blocks`, and the self-attention branch can be ablated with `--disable-self-attn`.
+
 ## Install (for development / training)
 
 We recommend using [`uv`](https://docs.astral.sh/uv/):
@@ -119,7 +142,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
 
-The base LLM (Gemma-2-2B-IT or Gemma-2-9B-IT) is downloaded from Hugging Face. Make sure you have run `hf login` and accepted the Gemma-2 license.
+The base LLM is downloaded from Hugging Face. Make sure you have run `hf login` and accepted the relevant model license (e.g. Gemma, Llama).
 
 ## Data
 
@@ -138,6 +161,13 @@ thirdparty/axbench/axbench/concept500/prod_2b_l20_v1/generate/
 ├── train_data.parquet
 └── metadata.jsonl
 ```
+
+### FLAS-46k
+
+Larger-scale runs use **FLAS-46k**, an AxBench-derived concept-steering corpus (~46k concepts, ~2.6M rows). The
+data is text-only and model-agnostic — activations are extracted live at the chosen `--layer`, so a single
+corpus trains any base model. FLAS-46k (and a fixed, reproducible held-out split for evaluation) will be
+released on the Hugging Face Hub; point `--data-dir` at it once downloaded.
 
 ## Hardware
 
@@ -202,6 +232,23 @@ uv run python scripts/chat.py \
     --flow-ckpt checkpoints/flas_2b_c500/best_step*.pt
 ```
 
+### Training on other base models
+
+The trainer is family-agnostic — choose the base model with `--model-id` and the steering layer with `--layer`.
+For example, Qwen3-8B at layer 20 with a single FlowBlock, self-attention ablated, on FLAS-46k:
+
+```bash
+uv run python -m flas.train \
+    --model-id Qwen/Qwen3-8B --data-dir data/flas-concept46k \
+    --layer 20 --num-blocks 1 --disable-self-attn \
+    --n-steps 3 --T-min 0.5 --T-max 2.0 \
+    --output-dir checkpoints --run-name flas46k_qwen3_8b
+```
+
+Base (non-instruct) models have no chat template, so pass `--prompt-format alpaca` (a minimal
+`### Instruction: / ### Response:` wrapper) for both training and generation — the format is saved in the
+checkpoint config and read back automatically at eval time.
+
 ## Evaluation protocol
 
 Following AxBench (Wu et al., 2025):
@@ -215,12 +262,12 @@ Following AxBench (Wu et al., 2025):
 ```
 flas/
 ├── src/flas/
-│   ├── model.py          # FlowBlock
+│   ├── model.py          # multi-family registry + FlowBlock / FlowFunction / ConceptEncoder
 │   ├── train.py          # PyTorch Lightning training
-│   ├── generate.py       # Batched generation
+│   ├── generate.py       # batched steered generation
 ├── scripts/
 │   ├── eval.py           # AxBench-aligned generation
-│   ├── judge_openai.py   # GPT-4o-mini judge
+│   ├── judge_openai.py   # GPT-4o-mini judge (OpenAI)
 │   └── chat.py           # interactive CLI
 ├── pyproject.toml
 ├── LICENSE
@@ -229,7 +276,7 @@ flas/
 
 ## Acknowledgements and data
 
-- **Base models** — [Gemma-2-2B-IT](https://huggingface.co/google/gemma-2-2b-it) and [Gemma-2-9B-IT](https://huggingface.co/google/gemma-2-9b-it) (Google).
+- **Base models** — [Gemma-2](https://huggingface.co/google/gemma-2-2b-it) and [Gemma-3](https://huggingface.co/google/gemma-3-4b-it) (Google), [Qwen3](https://huggingface.co/Qwen) (Alibaba), and [Llama-3.1](https://huggingface.co/meta-llama) (Meta).
 - **Steering data and evaluation pipeline** — [AxBench](https://github.com/stanfordnlp/axbench) (Wu et al., 2025): Concept500 / Concept16k corpora and the C/I/F judge prompts.
 - **Eval prompts** — [AlpacaEval](https://github.com/tatsu-lab/alpaca_eval) (Li et al., 2023): the 805 instructions used at evaluation time. The bundled `data/alpaca_eval.json` is a verbatim copy of [`tatsu-lab/alpaca_eval`](https://huggingface.co/datasets/tatsu-lab/alpaca_eval).
 

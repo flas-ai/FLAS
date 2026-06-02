@@ -72,13 +72,16 @@ def main():
     data_path = Path(args.data_dir)
     with open(data_path / "metadata.jsonl") as f:
         metadata = [json.loads(l) for l in f]
+    # Look up concept text by concept_id (works for both sequential c16k ids and
+    # flas-46k content-hash ids).
+    meta_by_id = {m["concept_id"]: m for m in metadata}
 
     if args.concept_ids_file:
         with open(args.concept_ids_file) as f:
             all_cids = json.load(f)
         print(f"Using {len(all_cids)} concept IDs from {args.concept_ids_file}")
     else:
-        all_cids = list(range(min(len(metadata), args.max_concepts)))
+        all_cids = [m["concept_id"] for m in metadata][:args.max_concepts]
 
     # Shard
     shard_idx, shard_total = map(int, args.shard.split("/"))
@@ -93,7 +96,7 @@ def main():
 
     all_results = []
     for i, cid in enumerate(tqdm(concept_ids, desc="Evaluating")):
-        concept_name = metadata[cid]["concept"]
+        concept_name = meta_by_id[cid]["concept"]
 
         # Sample prompts reproducibly (matching AxBench: seed=concept_id)
         rng = random.Random(cid)

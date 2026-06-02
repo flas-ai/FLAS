@@ -22,7 +22,7 @@ from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from flas.model import build_flow_model
+from flas.model import build_flow_model, get_text_decoder
 
 
 # ---------------------------------------------------------------------------
@@ -43,34 +43,52 @@ class SteeringDataset(Dataset):
         return self.samples[idx]
 
 
-def collate_fn(batch, tokenizer, max_len, concept_max_len):
+ALPACA_TEMPLATE = "### Instruction:\n{input}\n\n### Response:\n"
+
+
+def collate_fn(batch, tokenizer, max_len, concept_max_len, prompt_format="chat"):
     input_texts, output_texts, concept_texts, cids = zip(*batch)
 
     # Tokenize prompt and output separately, then concatenate ids
     # This avoids BPE boundary ambiguity at the prompt/output seam.
+    # Degenerate samples are SKIPPED (not asserted): rare flas-46k prompts
+    # exceed max_len leaving no room for output, and empty concepts would
+    # collapse cross-attention. Skipping drops <0.1% of samples and keeps
+    # training robust to outliers across tokenizers/chat-templates.
     full_ids_list = []
     prompt_lens = []
-    for inp, out in zip(input_texts, output_texts):
-        messages = [{"role": "user", "content": inp}]
-        prompt_enc = tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True)
-        prompt_ids = prompt_enc.input_ids if hasattr(prompt_enc, 'input_ids') else prompt_enc
+    keep_concepts = []
+    keep_cids = []
+    for inp, out, ct, cid in zip(input_texts, output_texts, concept_texts, cids):
+        if not ct or not ct.strip():
+            continue  # skip empty concept text
+        if prompt_format == "alpaca":
+            # Base models: minimal instruction wrapper, no chat template.
+            # add_special_tokens=True prepends a single BOS.
+            prompt_ids = tokenizer(
+                ALPACA_TEMPLATE.format(input=inp), add_special_tokens=True).input_ids
+        else:
+            messages = [{"role": "user", "content": inp}]
+            prompt_enc = tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True)
+            prompt_ids = prompt_enc.input_ids if hasattr(prompt_enc, 'input_ids') else prompt_enc
         output_ids = tokenizer(out, add_special_tokens=False).input_ids
         full_ids = (prompt_ids + output_ids)[:max_len]
         prompt_len = min(len(prompt_ids), len(full_ids))
-        # Ensure at least 1 output token remains (otherwise labels are all -100
-        # which would produce NaN loss in CrossEntropy).
-        assert prompt_len > 0, "prompt must have at least one token"
-        assert prompt_len < len(full_ids), (
-            f"sample has no output tokens (prompt={len(prompt_ids)}, "
-            f"output={len(output_ids)}, max_len={max_len}) — increase max_len")
+        # Skip if no prompt, or prompt fills max_len leaving no output token
+        # (labels would be all -100 -> NaN loss).
+        if prompt_len <= 0 or prompt_len >= len(full_ids):
+            continue
         full_ids_list.append(full_ids)
         prompt_lens.append(prompt_len)
+        keep_concepts.append(ct)
+        keep_cids.append(cid)
 
-    # Ensure every concept has at least one token (prevent all-masked rows
-    # in cross-attention, which would collapse to uniform attention).
-    for ct in concept_texts:
-        assert len(ct.strip()) > 0, "concept text must be non-empty"
+    if not full_ids_list:
+        raise RuntimeError("collate_fn: entire batch was skipped (all prompts "
+                           "exceeded max_len) — increase --max-len")
+    concept_texts = keep_concepts
+    cids = keep_cids
 
     # Right-pad to max length in batch
     enc = tokenizer.pad(
@@ -176,7 +194,7 @@ class FlasModule(pl.LightningModule):
             h_out = h.to(h_orig.dtype)
             return (h_out,) + output[1:] if is_tuple else h_out
 
-        handle = self.llm.model.layers[self.args.layer].register_forward_hook(hook)
+        handle = get_text_decoder(self.llm).layers[self.args.layer].register_forward_hook(hook)
         outputs = self.llm(input_ids=input_ids, attention_mask=attention_mask,
                            labels=labels)
         handle.remove()
@@ -333,23 +351,42 @@ def prepare_data(args, tokenizer):
     - Fixed n_val_samples random samples held out for eval
     Returns: train_loader, val_loader
     """
-    train_parquet = Path(args.data_dir) / "train_data.parquet"
-    if not train_parquet.exists():
-        train_parquet = Path(args.data_dir) / "train" / "data.parquet"
+    # Resolve the training parquet across dataset layouts:
+    #   AxBench prod dirs -> train_data.parquet  (cols: input/output/output_concept/category/concept_id)
+    #   flas-concept46k   -> train.parquet       (cols: input/output/concept/concept_id, no category)
+    for cand in ("train_data.parquet", "train/data.parquet", "train.parquet"):
+        train_parquet = Path(args.data_dir) / cand
+        if train_parquet.exists():
+            break
     df = pd.read_parquet(train_parquet)
-    pos_df = df[df["category"] == "positive"].reset_index(drop=True)
+    # Normalize schema: flas-46k names the steering-concept column `concept`.
+    if "output_concept" not in df.columns and "concept" in df.columns:
+        df = df.rename(columns={"concept": "output_concept"})
+    # flas-46k has no positive/negative `category` split — all rows are positive
+    # steering exemplars.
+    if "category" in df.columns:
+        pos_df = df[df["category"] == "positive"].reset_index(drop=True)
+    else:
+        pos_df = df.reset_index(drop=True)
     all_cids = sorted(pos_df["concept_id"].unique())
 
-    # Optional concept-level holdout
-    n_ho = min(args.val_n_concepts, len(all_cids) - 1) if args.val_n_concepts > 0 else 0
-    torch.manual_seed(42)
-    perm = torch.randperm(len(all_cids)).tolist()
-    if n_ho > 0:
-        ho_cids = set(all_cids[i] for i in perm[:n_ho])
+    # Concept-level holdout. Prefer an explicit id list (e.g. flas-46k uses a
+    # fixed held-out set so eval concepts never leak into training); otherwise
+    # fall back to a deterministic seed-42 sample of `val_n_concepts`.
+    if getattr(args, "heldout_ids_file", None):
+        ho_cids = set(json.load(open(args.heldout_ids_file)))
         train_df = pos_df[~pos_df["concept_id"].isin(ho_cids)].reset_index(drop=True)
-        print(f"Held out {n_ho} concepts for evaluation")
+        print(f"Held out {len(ho_cids)} concepts from {args.heldout_ids_file}")
     else:
-        train_df = pos_df
+        n_ho = min(args.val_n_concepts, len(all_cids) - 1) if args.val_n_concepts > 0 else 0
+        torch.manual_seed(42)
+        perm = torch.randperm(len(all_cids)).tolist()
+        if n_ho > 0:
+            ho_cids = set(all_cids[i] for i in perm[:n_ho])
+            train_df = pos_df[~pos_df["concept_id"].isin(ho_cids)].reset_index(drop=True)
+            print(f"Held out {n_ho} concepts for evaluation")
+        else:
+            train_df = pos_df
 
     # Hold out fixed n samples for validation
     n_val = min(args.n_val_samples, len(train_df) // 10)
@@ -364,7 +401,8 @@ def prepare_data(args, tokenizer):
     print(f"Val:   {len(val_df)} samples")
 
     collate = partial(collate_fn, tokenizer=tokenizer, max_len=args.max_len,
-                      concept_max_len=args.concept_max_len)
+                      concept_max_len=args.concept_max_len,
+                      prompt_format=getattr(args, "prompt_format", "chat"))
 
     train_loader = DataLoader(
         SteeringDataset(train_df), batch_size=args.batch_size,
@@ -405,6 +443,9 @@ def main():
                         help="Validate every N steps")
     parser.add_argument("--val-n-concepts", type=int, default=0,
                         help="Number of concepts held out (0=none, >0 for c16k)")
+    parser.add_argument("--heldout-ids-file", type=str, default=None,
+                        help="JSON list of concept_ids to hold out from training "
+                             "(overrides --val-n-concepts; used for flas-46k fixed holdout)")
     parser.add_argument("--n-val-samples", type=int, default=100,
                         help="Number of samples held out for validation")
     parser.add_argument("--max-len", type=int, default=256)
@@ -421,6 +462,9 @@ def main():
                         help="Disable causal self-attention in FlowBlocks")
     parser.add_argument("--disable-mlp", action="store_true",
                         help="Disable the MLP in FlowBlocks")
+    parser.add_argument("--prompt-format", choices=["chat", "alpaca"], default="chat",
+                        help="chat = tokenizer chat template (instruct models); "
+                             "alpaca = '### Instruction/### Response' wrapper (base models, no chat template)")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--save-every-n-evals", type=int, default=10,
                         help="Save periodic checkpoint every N eval rounds")
@@ -428,6 +472,9 @@ def main():
                         help="Max batches per val dataloader (avoid slow val on large datasets)")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader worker processes (0 = single-thread main process)")
+    parser.add_argument("--precision", type=str, default="bf16-mixed",
+                        help="Lightning trainer precision: 'bf16-mixed' (default) "
+                             "or '32' (fp32, matches the original flowsteer-qwen run)")
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
@@ -474,7 +521,7 @@ def main():
         enable_checkpointing=False,  # we handle checkpointing manually
         accelerator="gpu",
         devices=1,
-        precision="bf16-mixed",
+        precision=args.precision,
         log_every_n_steps=50,
     )
 

@@ -3,7 +3,15 @@ checkpoints/
 thirdparty/
 paper/
 .openai_key.sh
+.openai_keys.sh
 uv.lock
+
+# internal-only: research analysis scripts + planning/handoff docs (not for public main)
+analysis/
+plan/
+.claude/
+# internal-only ops (Azure judge + eval/judge watchers): private Azure endpoint, keep local
+judge_azure/
 
 # data: whitelist only existing tracked files
 data/*

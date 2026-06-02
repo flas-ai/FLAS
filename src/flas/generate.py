@@ -43,6 +43,10 @@ class FlasGenerator:
         self._is_prefill = True
         self._past_len = 0             # Position offset for RoPE / KV cache
         self._position_ids = None      # [batch, seq_len] per-sample positions (handles left-padding)
+        # Optional intervention for analysis (default None = normal steering).
+        # dict with: "steps" (list of Euler step indices to apply, e.g. [0] or
+        # [1,2]; None=all) and/or "scale" (scale the NET displacement; None=1.0).
+        self._iv = None
 
     def _hook_fn(self, module, input, output):
         if not self._active:
@@ -53,7 +57,10 @@ class FlasGenerator:
         bsz = h.size(0)
         dt = (self._flowtimes[:bsz] / self._n_steps).to(self._flow_dtype)
 
-        for k in range(self._n_steps):
+        # Which Euler steps to apply (intervention support; default all).
+        step_list = (self._iv["steps"] if (self._iv and self._iv.get("steps") is not None)
+                     else range(self._n_steps))
+        for k in step_list:
             t_k = dt * k
             if self._is_prefill:
                 v, kv_caches = self.flow_fn(
@@ -74,12 +81,18 @@ class FlasGenerator:
                 self._sa_caches[k] = kv_caches
             h = h + dt.unsqueeze(1).unsqueeze(2) * v
 
+        # Optional: scale the NET displacement (dose / suppression sweep).
+        if self._iv and self._iv.get("scale") is not None:
+            h_base = h_orig.to(self._flow_dtype)
+            h = h_base + self._iv["scale"] * (h - h_base)
+
         h_out = h.to(h_orig.dtype)
         return (h_out,) + output[1:] if is_tuple else h_out
 
     def _install_hook(self):
         if self._hook_handle is None:
-            self._hook_handle = self.llm.model.layers[self.layer].register_forward_hook(
+            from flas.model import get_text_decoder
+            self._hook_handle = get_text_decoder(self.llm).layers[self.layer].register_forward_hook(
                 self._hook_fn)
 
     def _remove_hook(self):
@@ -107,9 +120,16 @@ class FlasGenerator:
         pairs = []
         formatted = []
         for pi, prompt in enumerate(prompts):
-            msgs = [{"role": "user", "content": prompt}]
-            fmt = self.tokenizer.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True)
+            if getattr(self, "_prompt_format", "chat") == "alpaca":
+                # Base models: minimal wrapper. The batch is tokenized with
+                # add_special_tokens=False, so prepend BOS to match train.py.
+                fmt = f"### Instruction:\n{prompt}\n\n### Response:\n"
+                if self.tokenizer.bos_token:
+                    fmt = self.tokenizer.bos_token + fmt
+            else:
+                msgs = [{"role": "user", "content": prompt}]
+                fmt = self.tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True)
             for flowtime in flowtimes:
                 pairs.append((pi, flowtime))
                 formatted.append(fmt)
@@ -257,7 +277,8 @@ def load_generator(flow_ckpt, model_id=None, layer=None, num_blocks=None):
     for p in llm.parameters():
         p.requires_grad = False
 
-    config = AutoConfig.from_pretrained(model_id)
+    from flas.model import get_text_config
+    config = get_text_config(AutoConfig.from_pretrained(model_id))
     flow_fn = FlowFunction(config, num_blocks=num_blocks, time_conditioned=True,
                            layer_idx=layer,
                            disable_cross_attn=cfg.get("disable_cross_attn", False),
@@ -269,7 +290,14 @@ def load_generator(flow_ckpt, model_id=None, layer=None, num_blocks=None):
     target_dtype = next(iter(sd.values())).dtype
     print(f"  flow weights dtype: {target_dtype}", flush=True)
     flow_fn.to(target_dtype)
-    flow_fn.load_state_dict(sd)
+    # strict=False tolerates legacy checkpoints that carry stale self_attn keys
+    # (trained before no-self-attn skipped building the module).
+    missing, unexpected = flow_fn.load_state_dict(sd, strict=False)
+    real_missing = [k for k in missing if "self_attn" not in k and "pre_sa_norm" not in k and "post_sa_norm" not in k]
+    if real_missing:
+        print(f"  WARNING: {len(real_missing)} missing keys (e.g. {real_missing[:3]})", flush=True)
+    if unexpected:
+        print(f"  ignoring {len(unexpected)} unexpected keys (legacy self_attn): {unexpected[:2]}", flush=True)
     flow_fn = flow_fn.to("cuda").eval()
 
     if "concept_enc" in ckpt:
@@ -282,4 +310,7 @@ def load_generator(flow_ckpt, model_id=None, layer=None, num_blocks=None):
         # layers / norm / rotary_emb. Inherits base LLM's bf16 dtype.
         concept_enc = ConceptEncoder.from_base_model(llm, num_layers=2)
 
-    return FlasGenerator(llm, tokenizer, flow_fn, concept_enc, layer)
+    generator = FlasGenerator(llm, tokenizer, flow_fn, concept_enc, layer)
+    generator._prompt_format = cfg.get("prompt_format", "chat")
+    print(f"  prompt_format={generator._prompt_format}", flush=True)
+    return generator
