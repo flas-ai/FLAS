@@ -39,13 +39,20 @@ MODELS = {
     "Gemma-2-2B-IT":          ("flas-ai/flas-gemma-2-2b-it",         "flas-gemma-2-2b-it.safetensors",         "google/gemma-2-2b-it",             "instruct"),
     "Gemma-2-9B-IT":          ("flas-ai/flas-gemma-2-9b-it",         "flas-gemma-2-9b-it.safetensors",         "google/gemma-2-9b-it",             "instruct"),
     "Gemma-3-4B-IT":          ("flas-ai/flas-gemma-3-4b-it",         "flas-gemma-3-4b-it.safetensors",         "google/gemma-3-4b-it",             "instruct"),
-    "Gemma-3-4B-PT · base":   ("flas-ai/flas-gemma-3-4b-pt",         "flas-gemma-3-4b-pt.safetensors",         "google/gemma-3-4b-pt",             "base"),
+    "Gemma-3-4B-PT (base)":   ("flas-ai/flas-gemma-3-4b-pt",         "flas-gemma-3-4b-pt.safetensors",         "google/gemma-3-4b-pt",             "base"),
     "Qwen3-8B":               ("flas-ai/flas-qwen3-8b",              "flas-qwen3-8b.safetensors",              "Qwen/Qwen3-8B",                    "instruct"),
-    "Qwen3-8B · base":        ("flas-ai/flas-qwen3-8b-base",         "flas-qwen3-8b-base.safetensors",         "Qwen/Qwen3-8B-Base",               "base"),
+    "Qwen3-8B-Base (base)":   ("flas-ai/flas-qwen3-8b-base",         "flas-qwen3-8b-base.safetensors",         "Qwen/Qwen3-8B-Base",               "base"),
     "Llama-3.1-8B-Instruct":  ("flas-ai/flas-llama-3.1-8b-instruct", "flas-llama-3.1-8b-instruct.safetensors", "meta-llama/Llama-3.1-8B-Instruct", "instruct"),
-    "Llama-3.1-8B · base":    ("flas-ai/flas-llama-3.1-8b",          "flas-llama-3.1-8b.safetensors",          "meta-llama/Llama-3.1-8B",          "base"),
+    "Llama-3.1-8B (base)":    ("flas-ai/flas-llama-3.1-8b",          "flas-llama-3.1-8b.safetensors",          "meta-llama/Llama-3.1-8B",          "base"),
 }
 DEFAULT_MODEL = "Gemma-2-2B-IT"
+
+
+def _is_qwen3_instruct(label):
+    """Thinking-mode applies only to the Qwen3 *instruct* model (the base uses Alpaca)."""
+    info = MODELS.get(label)
+    return bool(info and info[3] == "instruct" and "Qwen3" in info[2])
+
 
 _loaded = {}      # label -> generator (only the active one is kept)
 
@@ -79,12 +86,14 @@ def steer(model_name, concept, prompt, flowtime, n_steps, max_tokens, temperatur
     if not prompt.strip():
         return "(prompt is empty)", "(prompt is empty)"
     gen = _ensure(model_name)
-    et = bool(think)  # only affects Qwen3-style chat templates; ignored elsewhere
+    # Only pass enable_thinking when explicitly on, so the default path still works on
+    # a flas build that predates the parameter (Qwen3-only; ignored elsewhere).
+    et_kw = {"enable_thinking": True} if think else {}
     baseline = gen.generate_batch(
         [prompt], concept or " ",
         flowtimes=[0.0], n_steps=int(n_steps),
         max_tokens=int(max_tokens), temperature=float(temperature), max_batch=1,
-        enable_thinking=et,
+        **et_kw,
     )[0]["generation"]
     if not concept.strip():
         return "(set a concept to see the steered output)", baseline
@@ -92,7 +101,7 @@ def steer(model_name, concept, prompt, flowtime, n_steps, max_tokens, temperatur
         [prompt], concept,
         flowtimes=[float(flowtime)], n_steps=int(n_steps),
         max_tokens=int(max_tokens), temperature=float(temperature), max_batch=1,
-        enable_thinking=et,
+        **et_kw,
     )[0]["generation"]
     return steered, baseline
 
@@ -149,8 +158,10 @@ theme = gr.themes.Soft(
 
 CSS = f"""
 :root {{ color-scheme: light; }}
-.gradio-container {{ max-width: 1280px !important; margin: 0 auto !important;
-  padding: 14px 28px 36px !important; background: {PAGE}; }}
+.gradio-container {{ max-width: 1460px !important; margin: 0 auto !important;
+  padding: 14px 32px 36px !important; background: {PAGE}; }}
+/* let the controls row breathe so slider labels + number boxes stay on one line */
+.flas-card .gr-slider, .flas-card .wrap label {{ min-width: 0; }}
 footer {{ display: none !important; }}
 
 /* hero */
@@ -199,7 +210,7 @@ with gr.Blocks(title="FLAS — Flow-based Activation Steering") as demo:
             info="8 FLAS checkpoints · base variants use an Alpaca prompt automatically",
         )
         think_toggle = gr.Checkbox(
-            value=False, visible=("Qwen3" in DEFAULT_MODEL),
+            value=False, visible=_is_qwen3_instruct(DEFAULT_MODEL),
             label="Qwen3 thinking mode (experimental)",
             info="Let Qwen3 emit its <think> reasoning while being steered. FLAS was trained "
                  "on the non-thinking template, so this is off-distribution — exploratory.",
@@ -228,8 +239,8 @@ with gr.Blocks(title="FLAS — Flow-based Activation Steering") as demo:
         gr.Examples(EXAMPLES, inputs=[concept, prompt], label="Try one of these",
                     examples_per_page=6)
 
-    # Thinking toggle only makes sense for Qwen3-series models; hide it otherwise.
-    model.change(lambda m: gr.update(visible=("Qwen3" in m)), model, think_toggle)
+    # Thinking toggle only makes sense for the Qwen3 instruct model; hide it otherwise.
+    model.change(lambda m: gr.update(visible=_is_qwen3_instruct(m)), model, think_toggle)
 
     inputs = [model, concept, prompt, flowtime, n_steps, max_tokens, temperature, think_toggle]
     run_btn.click(lambda m: f"⏳ running {m} … (first use of a model downloads it)", model, status).then(
