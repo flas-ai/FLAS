@@ -22,7 +22,7 @@ from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from flas.model import build_flow_model, get_text_decoder
+from flas.model import build_flow_model, get_text_decoder, build_chat_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -68,9 +68,10 @@ def collate_fn(batch, tokenizer, max_len, concept_max_len, prompt_format="chat")
             prompt_ids = tokenizer(
                 ALPACA_TEMPLATE.format(input=inp), add_special_tokens=True).input_ids
         else:
-            messages = [{"role": "user", "content": inp}]
-            prompt_enc = tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True)
+            # Chat models. build_chat_prompt forces non-thinking mode for Qwen3-style
+            # hybrid-reasoning models (empty <think></think>), matching the no-reasoning
+            # targets and the eval-time prompt.
+            prompt_enc = build_chat_prompt(tokenizer, inp, tokenize=True)
             prompt_ids = prompt_enc.input_ids if hasattr(prompt_enc, 'input_ids') else prompt_enc
         output_ids = tokenizer(out, add_special_tokens=False).input_ids
         full_ids = (prompt_ids + output_ids)[:max_len]
