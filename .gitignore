@@ -13,6 +13,9 @@ plan/
 # internal-only ops (Azure judge + eval/judge watchers): private Azure endpoint, keep local
 judge_azure/
 
+# the Gradio demo is maintained separately in the Lunamos/flas-demo Space
+space/
+
 # data: whitelist only existing tracked files
 data/*
 !data/alpaca_eval.json
