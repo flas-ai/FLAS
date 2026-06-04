@@ -245,6 +245,89 @@ class FlasGenerator:
         self._remove_hook()
         return all_results
 
+    @torch.no_grad()
+    def generate_stream(self, prompt, concept_text, flowtime, n_steps=2,
+                        max_tokens=128, temperature=1.0, enable_thinking=False,
+                        stop_event=None):
+        """Stream a single steered generation token-by-token (interruptible).
+
+        Yields the cumulative decoded text after each new token. `flowtime=0.0` is the
+        unsteered baseline (the hook is an identity at dt=0). Interruption: pass any object
+        with ``.is_set()`` (e.g. threading.Event) as ``stop_event`` and set it to halt; the
+        generator also cleans up (removes the hook, frees the KV cache) if the consumer
+        stops early (GeneratorExit) or an error occurs — see the ``finally`` block.
+        """
+        self._n_steps = n_steps
+        concept_hidden, concept_mask = self.encode_concept(concept_text)
+
+        if getattr(self, "_prompt_format", "chat") == "alpaca":
+            fmt = f"### Instruction:\n{prompt}\n\n### Response:\n"
+            if self.tokenizer.bos_token:
+                fmt = self.tokenizer.bos_token + fmt
+        else:
+            fmt = build_chat_prompt(self.tokenizer, prompt, tokenize=False,
+                                    enable_thinking=enable_thinking)
+
+        enc = self.tokenizer(fmt, return_tensors="pt", truncation=True,
+                             max_length=512, add_special_tokens=False).to("cuda")
+        input_ids = enc.input_ids
+        attention_mask = enc.attention_mask
+        prompt_len = input_ids.shape[1]
+
+        self._concept_hidden = concept_hidden
+        self._concept_mask = concept_mask
+        self._flowtimes = torch.tensor([flowtime], device="cuda", dtype=torch.float32)
+        self._padding_mask = attention_mask.float()
+        self._sa_caches = [None] * self._n_steps
+        self._is_prefill = True
+        self._past_len = 0
+        self._position_ids = (attention_mask.cumsum(-1) - 1).clamp(min=0)
+
+        past_kv = None
+        try:
+            self._install_hook()
+            self._active = True
+
+            out = self.llm(input_ids, attention_mask=attention_mask,
+                           position_ids=self._position_ids, use_cache=True)
+            past_kv = out.past_key_values
+            next_logits = out.logits[:, -1, :]
+
+            self._is_prefill = False
+            self._past_len = prompt_len
+
+            gen_ids = []
+            for _ in range(max_tokens):
+                if stop_event is not None and stop_event.is_set():
+                    break
+                if temperature > 0:
+                    probs = torch.softmax(next_logits / temperature, dim=-1)
+                    next_token = torch.multinomial(probs, 1)
+                else:
+                    next_token = next_logits.argmax(dim=-1, keepdim=True)
+                tok = next_token.item()
+                if tok == self.tokenizer.eos_token_id:
+                    break
+                gen_ids.append(tok)
+                yield self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+                attention_mask = torch.cat(
+                    [attention_mask, torch.ones(1, 1, dtype=torch.long, device="cuda")], dim=1)
+                self._padding_mask = attention_mask.float()
+                self._position_ids = (attention_mask.cumsum(-1) - 1).clamp(min=0)[:, -1:]
+                out = self.llm(next_token, attention_mask=attention_mask,
+                               position_ids=self._position_ids,
+                               past_key_values=past_kv, use_cache=True)
+                past_kv = out.past_key_values
+                next_logits = out.logits[:, -1, :]
+                self._past_len += 1
+        finally:
+            self._active = False
+            self._sa_caches = None
+            self._remove_hook()
+            del past_kv
+            torch.cuda.empty_cache()
+
 
 def load_generator(flow_ckpt, model_id=None, layer=None, num_blocks=None):
     """Load a FlasGenerator from a checkpoint.
