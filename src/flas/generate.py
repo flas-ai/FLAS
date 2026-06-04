@@ -7,7 +7,7 @@ entering self-attention differ across steps (h is modified by previous steps).
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from flas.model import FlowFunction, ConceptEncoder
+from flas.model import FlowFunction, ConceptEncoder, build_chat_prompt
 
 
 def _load_ckpt(path):
@@ -112,7 +112,8 @@ class FlasGenerator:
 
     @torch.no_grad()
     def generate_batch(self, prompts, concept_text, flowtimes, n_steps=2,
-                       max_tokens=128, temperature=1.0, max_batch=16):
+                       max_tokens=128, temperature=1.0, max_batch=16,
+                       enable_thinking=False):
         self._n_steps = n_steps
 
         concept_hidden, concept_mask = self.encode_concept(concept_text)
@@ -127,9 +128,11 @@ class FlasGenerator:
                 if self.tokenizer.bos_token:
                     fmt = self.tokenizer.bos_token + fmt
             else:
-                msgs = [{"role": "user", "content": prompt}]
-                fmt = self.tokenizer.apply_chat_template(
-                    msgs, tokenize=False, add_generation_prompt=True)
+                # Chat models. build_chat_prompt defaults to NON-thinking for Qwen3-style
+                # hybrid-reasoning models (matches training); enable_thinking=True is an
+                # experimental opt-in to let Qwen3 think while steered.
+                fmt = build_chat_prompt(self.tokenizer, prompt, tokenize=False,
+                                        enable_thinking=enable_thinking)
             for flowtime in flowtimes:
                 pairs.append((pi, flowtime))
                 formatted.append(fmt)

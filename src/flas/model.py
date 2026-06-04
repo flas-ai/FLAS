@@ -749,3 +749,27 @@ def build_flow_model(model_id="google/gemma-2-2b-it", layer=20, num_blocks=2,
     concept_enc = ConceptEncoder(model_id, num_layers=2)
 
     return flow_fn, concept_enc
+
+
+def build_chat_prompt(tokenizer, user_text, tokenize=True, add_generation_prompt=True,
+                      enable_thinking=False):
+    """Apply the tokenizer's chat template, correctly handling hybrid-reasoning models.
+
+    Qwen3-style models expose an ``enable_thinking`` flag in their chat template: by
+    default they emit a ``<think>...</think>`` reasoning trace before the answer.
+
+    ``enable_thinking`` (default ``False``): FLAS is *trained* on direct-answer targets
+    (no reasoning), so training always passes False — this injects the empty
+    ``<think></think>`` block, keeping the train prompt non-thinking. At inference you may
+    set True to *experimentally* let a Qwen3-style model think while it is being steered
+    (the flow only ever learned the non-thinking template, so this is off-distribution but
+    valid to explore). The flag only affects templates that support it; Llama-3.1 /
+    Gemma-2/3 ignore it. Used by BOTH train.py and generate.py so the paths cannot drift.
+    """
+    kwargs = {}
+    if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
+        kwargs["enable_thinking"] = bool(enable_thinking)
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": user_text}],
+        tokenize=tokenize, add_generation_prompt=add_generation_prompt, **kwargs,
+    )

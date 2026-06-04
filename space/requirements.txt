@@ -1,7 +1,9 @@
-torch>=2.1
-transformers>=4.44
+torch>=2.8
+transformers>=4.52
+accelerate>=0.30
 safetensors>=0.4
-huggingface_hub>=0.24
-gradio>=5.0
+sentencepiece
+pillow
+huggingface_hub>=0.34
 spaces
 flas @ git+https://github.com/flas-ai/FLAS.git@main
