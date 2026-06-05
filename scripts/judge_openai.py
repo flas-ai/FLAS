@@ -194,7 +194,7 @@ async def run_judge(samples, client, model, concurrency=8, save_path=None,
                 n_retry_ok += 1
         print(f"Retry: {n_retry_ok}/{len(retry_indices)} recovered", flush=True)
         if save_path:
-            _save(save_path, judged, model)
+            _save(save_path, judged)
 
     remaining = samples[start_idx:]
     if not remaining:
@@ -231,75 +231,23 @@ async def run_judge(samples, client, model, concurrency=8, save_path=None,
                 _save(save_path, judged, model)
 
     if save_path:
-        _save(save_path, judged, model)
+        _save(save_path, judged)
     print(f"Done. {len(judged)} samples, {n_failed} judge failures.", flush=True)
     return judged
 
 
-def _save(path, judged, model):
-    ok = [j for j in judged if j.get("scores") is not None]
-    summary = {"n_samples": len(judged), "n_judged": len(ok),
-               "n_failed": len(judged) - len(ok), "judge_model": model}
-    if ok:
-        summary.update({
-            "concept": float(np.mean([j["scores"]["concept_score"] for j in ok])),
-            "instruction": float(np.mean([j["scores"]["instruction_score"] for j in ok])),
-            "fluency": float(np.mean([j["scores"]["fluency_score"] for j in ok])),
-            "harmonic_mean": float(np.mean([j["scores"]["harmonic_mean"] for j in ok])),
-        })
-        # Per-factor max if the right fields exist
-        if all(k in ok[0] for k in ("concept_id", "input_id", "factor")):
-            pfm = _per_factor_max(ok)
-            if pfm:
-                summary["per_factor_max"] = pfm
+def _save(path, judged):
+    """Checkpoint the raw per-sample judgments ONLY (the resume cache).
 
+    Score aggregation is intentionally NOT done here: it is computed once at the
+    end into a SEPARATE scores file (see ``write_scores``). This keeps streaming
+    saves cheap and avoids repeatedly re-aggregating over growing partial data.
+    """
     with open(path, "w") as f:
-        json.dump({"summary": summary, "samples": judged},
-                  f, indent=2, ensure_ascii=False)
+        json.dump({"samples": judged}, f, indent=2, ensure_ascii=False)
 
 
-def _per_factor_max(judged, split_ratio=0.5):
-    """AxBench-aligned: prompt-split per concept, select factor on train."""
-    by_concept = defaultdict(list)
-    for s in judged:
-        by_concept[s["concept_id"]].append(s)
-
-    test_scores = []
-    factor_choices = []
-
-    for cid, sam in sorted(by_concept.items()):
-        input_ids = sorted(set(s["input_id"] for s in sam))
-        if len(input_ids) < 2:
-            train_ids = set(input_ids)
-            test_ids = set(input_ids)
-        else:
-            n_train = max(1, int(len(input_ids) * (1 - split_ratio)))
-            train_ids = set(input_ids[:n_train])
-            test_ids = set(input_ids[n_train:])
-
-        factor_train = defaultdict(list)
-        for s in sam:
-            if s["input_id"] in train_ids:
-                factor_train[s["factor"]].append(s["scores"]["harmonic_mean"])
-        if not factor_train:
-            continue
-        best = max(factor_train, key=lambda f: np.mean(factor_train[f]))
-        factor_choices.append(best)
-
-        for s in sam:
-            if s["input_id"] in test_ids and s["factor"] == best:
-                test_scores.append(s["scores"])
-
-    if not test_scores:
-        return None
-    return {
-        "hmean": float(np.mean([s["harmonic_mean"] for s in test_scores])),
-        "concept": float(np.mean([s["concept_score"] for s in test_scores])),
-        "instruction": float(np.mean([s["instruction_score"] for s in test_scores])),
-        "fluency": float(np.mean([s["fluency_score"] for s in test_scores])),
-        "n_concepts": len(by_concept),
-        "n_test_samples": len(test_scores),
-    }
+_SCORE_HINT = "Aggregate per-T scores (decoupled):  python scripts/score.py {cache}"
 
 
 def main():
@@ -336,24 +284,9 @@ def main():
         concurrency=args.concurrency, save_path=output_path))
 
     ok = [j for j in judged if j.get("scores") is not None]
-    if not ok:
-        print("\nNo successfully judged samples.")
-        return
-
-    print(f"\n{'='*60}")
-    print(f"GPT-4o-mini Judge ({len(ok)}/{len(judged)} ok)")
-    print(f"  Concept:     {np.mean([j['scores']['concept_score'] for j in ok]):.3f}")
-    print(f"  Instruction: {np.mean([j['scores']['instruction_score'] for j in ok]):.3f}")
-    print(f"  Fluency:     {np.mean([j['scores']['fluency_score'] for j in ok]):.3f}")
-    print(f"  HMean:       {np.mean([j['scores']['harmonic_mean'] for j in ok]):.3f}")
-    if all(k in ok[0] for k in ("concept_id", "input_id", "factor")):
-        pfm = _per_factor_max(ok)
-        if pfm:
-            print(f"\n  Per-factor max (prompt-split):")
-            print(f"    HMean={pfm['hmean']:.3f}  C={pfm['concept']:.3f} "
-                  f"I={pfm['instruction']:.3f} F={pfm['fluency']:.3f}  "
-                  f"(n_concepts={pfm['n_concepts']}, n_test={pfm['n_test_samples']})")
-    print(f"Saved to {output_path}")
+    print(f"\nJudged {len(ok)}/{len(judged)} ok ({len(judged) - len(ok)} failed/filtered).")
+    print(f"Cache -> {output_path}")
+    print(_SCORE_HINT.format(cache=output_path))
 
 
 if __name__ == "__main__":
