@@ -31,6 +31,25 @@ class FlasGenerator:
         self.layer = layer
         self._flow_dtype = next(flow_fn.parameters()).dtype
 
+        # Stop tokens. Instruction-tuned models END THEIR ASSISTANT TURN with a
+        # turn/eot token that is NOT tokenizer.eos_token_id: gemma-4 ends on
+        # <turn|>=106 (tokenizer.eos_token_id=1), gemma-2/3 on <end_of_turn>,
+        # qwen3 on <|im_end|>, llama-3.1 on <|eot_id|>. The model's
+        # generation_config.eos_token_id holds the full stop set the authors
+        # intend; stopping only on tokenizer.eos_token_id would let steered
+        # generation run to max_tokens and hallucinate extra turns. Union both.
+        stop = set()
+        gc = getattr(llm, "generation_config", None)
+        gc_eos = getattr(gc, "eos_token_id", None) if gc is not None else None
+        if isinstance(gc_eos, (list, tuple)):
+            stop.update(int(x) for x in gc_eos)
+        elif gc_eos is not None:
+            stop.add(int(gc_eos))
+        if tokenizer.eos_token_id is not None:
+            stop.add(int(tokenizer.eos_token_id))
+        self._stop_ids = stop
+        self._stop_ids_tensor = None  # lazily built per-device
+
         # Hook state
         self._hook_handle = None
         self._active = False
@@ -99,6 +118,14 @@ class FlasGenerator:
         if self._hook_handle is not None:
             self._hook_handle.remove()
             self._hook_handle = None
+
+    def _stop_tensor(self, device):
+        """Cached tensor of stop-token ids on the given device."""
+        if (self._stop_ids_tensor is None
+                or self._stop_ids_tensor.device != torch.device(device)):
+            self._stop_ids_tensor = torch.tensor(
+                sorted(self._stop_ids), device=device, dtype=torch.long)
+        return self._stop_ids_tensor
 
     def encode_concept(self, text, max_len=64):
         enc = self.tokenizer(
@@ -201,7 +228,8 @@ class FlasGenerator:
                 attention_mask = torch.cat(
                     [attention_mask, unfinished.unsqueeze(1).long()], dim=1)
 
-                eos_hit = (next_token.squeeze(1) == self.tokenizer.eos_token_id)
+                eos_hit = torch.isin(next_token.squeeze(1),
+                                     self._stop_tensor(next_token.device))
                 unfinished = unfinished & ~eos_hit
                 if not unfinished.any():
                     break
@@ -306,7 +334,7 @@ class FlasGenerator:
                 else:
                     next_token = next_logits.argmax(dim=-1, keepdim=True)
                 tok = next_token.item()
-                if tok == self.tokenizer.eos_token_id:
+                if tok in self._stop_ids:
                     break
                 gen_ids.append(tok)
                 yield self.tokenizer.decode(gen_ids, skip_special_tokens=True)

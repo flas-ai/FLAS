@@ -199,12 +199,48 @@ def _gemma3_spec():
     )
 
 
+def _gemma4_unified_spec():
+    # Gemma-4 ("gemma4_unified"): natively multimodal (text+vision+audio); we
+    # steer the TEXT decoder only. The text layer is gemma3-like (attn + dense
+    # MLP + the same 4-norm layout), so MoE / per-layer-input are NOT cloned
+    # (both are disabled in the 12B config anyway). Self-attention is NOT cloned
+    # into the FlowBlock: gemma4 attention uses a per-layer-type head_dim
+    # (sliding=head_dim, full=global_head_dim), k==v (no v_proj) and shared-KV
+    # — run with --disable-self-attn (enforced in build_flow_model).
+    from transformers.models.gemma4_unified.modeling_gemma4_unified import (
+        Gemma4UnifiedRMSNorm, Gemma4UnifiedTextRotaryEmbedding,
+        Gemma4UnifiedTextAttention)
+    return ArchSpec(
+        rms_norm_cls=Gemma4UnifiedRMSNorm,
+        rotary_emb_cls=Gemma4UnifiedTextRotaryEmbedding,
+        attention_cls=Gemma4UnifiedTextAttention,
+        embed_scale=True,  # Gemma family; ScaledWordEmbedding scales in-layer (guarded by hasattr)
+        needs_layer_types=True,
+        self_attn_layer_idx_fn=lambda layer_idx: 0,
+        # Same 4-norm layout as gemma2/3 (input/post-attn/pre-ff/post-ff).
+        norm_init_map={
+            "pre_sa_norm": "input_layernorm",
+            "post_sa_norm": "post_attention_layernorm",
+            "pre_mlp_norm": "pre_feedforward_layernorm",
+            "post_mlp_norm": "post_feedforward_layernorm",
+        },
+        # Cross-attn uses the SLIDING rope: its cos/sin dim == config.head_dim
+        # (256), matching the FlowCrossAttention head_dim. (The full-attention
+        # rope is "proportional" over global_head_dim=512 — we deliberately do
+        # not use it; concept text <=64 tokens << sliding_window so the sliding
+        # vs full distinction is irrelevant for the learned cross-attn module.)
+        rope_layer_type="sliding_attention",
+    )
+
+
 _ARCH_REGISTRY: Dict[str, Callable[[], ArchSpec]] = {
     "gemma2": _gemma2_spec,
     "qwen3": _qwen3_spec,
     "llama": _llama_spec,
     "gemma3": _gemma3_spec,
     "gemma3_text": _gemma3_spec,
+    "gemma4_unified": _gemma4_unified_spec,
+    "gemma4_unified_text": _gemma4_unified_spec,
 }
 
 
@@ -696,10 +732,12 @@ def build_flow_model(model_id="google/gemma-2-2b-it", layer=20, num_blocks=2,
     """
     config = get_text_config(AutoConfig.from_pretrained(model_id))
     spec = get_arch_spec(config)
-    if not disable_self_attn and str(getattr(config, "model_type", "")).startswith("gemma3"):
+    _mt = str(getattr(config, "model_type", ""))
+    if not disable_self_attn and (_mt.startswith("gemma3") or _mt.startswith("gemma4")):
         raise ValueError(
-            "gemma3 self-attention is not supported in FlowBlock (its dual-rope "
-            "sliding attention is not cloned). Run gemma3 with --disable-self-attn.")
+            f"{_mt} self-attention is not supported in FlowBlock (its dual-rope "
+            "sliding attention — and, for gemma4, per-layer-type head_dim / k==v "
+            "/ shared-KV — is not cloned). Run with --disable-self-attn.")
     flow_fn = FlowFunction(config, num_blocks=num_blocks,
                            time_conditioned=time_conditioned,
                            layer_idx=layer,
