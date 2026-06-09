@@ -228,7 +228,7 @@ async def run_judge(samples, client, model, concurrency=8, save_path=None,
                       f"(ok={len(recent)}/{save_every}, total_failed={n_failed})",
                       flush=True)
             if save_path:
-                _save(save_path, judged, model)
+                _save(save_path, judged)
 
     if save_path:
         _save(save_path, judged)
