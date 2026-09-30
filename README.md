@@ -1,11 +1,14 @@
 # FLAS
 
-**Flow-based Activation Steering for Inference-Time Intervention.**
+**Flow-based Activation Steering for Inference-Time Intervention.** NeurIPS 2026 (Poster).
 
+[![NeurIPS 2026](https://img.shields.io/badge/NeurIPS-2026%20Poster-8B5CF6)](https://arxiv.org/abs/2605.05892)
 [![Project Page](https://img.shields.io/badge/Project%20Page-flas--ai.github.io-4c1)](https://flas-ai.github.io)
 [![arXiv](https://img.shields.io/badge/arXiv-2605.05892-b31b1b.svg)](https://arxiv.org/abs/2605.05892)
 [![🤗 Model](https://img.shields.io/badge/🤗%20Model-flas--gemma--2-FFD21E)](https://huggingface.co/collections/flas-ai/flas)
 [![🤗 Demo](https://img.shields.io/badge/🤗%20Spaces-flas--demo-FFD21E)](https://huggingface.co/spaces/Lunamos/flas-demo)
+[![Video](https://img.shields.io/badge/Video-YouTube-FF0000?logo=youtube&logoColor=white)](https://youtu.be/5Tg7fNdvvvs)
+[![Video (CN)](https://img.shields.io/badge/Video%20(CN)-Bilibili-00A1D6?logo=bilibili&logoColor=white)](https://www.bilibili.com/video/BV16Wa76aEnL)
 
 FLAS is a natural-language activation-steering method for LLMs. Where prior work like [*Golden Gate Claude*](https://www.anthropic.com/news/golden-gate-claude) had to lock in a single behavior in advance, FLAS learns a single general concept-conditioned velocity field $v_\theta(h, t, c)$. At inference you hand it any natural-language concept $c$ and it produces the right inference-time intervention. The same checkpoint handles thousands of unseen concepts, and is the first learned steering method to consistently outperform in-context prompting on AxBench.
 
@@ -281,14 +284,15 @@ flas/
 ## Citation
 
 ```bibtex
-@article{flas2026,
-  title  = {Beyond Steering Vector: Flow-based Activation Steering for Inference-Time Intervention},
-  author = {Zehao Jin and Ruixuan Deng and Junran Wang and Xinjie Shen and Chao Zhang},
-  year   = {2026},
-  eprint = {2605.05892},
+@inproceedings{flas2026,
+  title     = {Beyond Steering Vector: Flow-based Activation Steering for Inference-Time Intervention},
+  author    = {Zehao Jin and Ruixuan Deng and Junran Wang and Xinjie Shen and Chao Zhang},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2026},
+  eprint    = {2605.05892},
   archivePrefix = {arXiv},
-  primaryClass = {cs.CL},
-  url    = {https://arxiv.org/abs/2605.05892},
+  primaryClass  = {cs.CL},
+  url       = {https://arxiv.org/abs/2605.05892},
 }
 ```
 
